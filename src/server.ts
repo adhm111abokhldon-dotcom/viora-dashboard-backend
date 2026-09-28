@@ -1,11 +1,11 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import { connectDB } from "./config/db";
-import productRoutes from "./routes/productRoutes";
-import orderRoutes from "./routes/orderRoutes";
-import reportRoutes from "./routes/reportRoutes";
-import dashboardRoutes from "./routes/dashboardRoutes";
+import { connectDB } from "./config/db.js";
+import productRoutes from "./routes/productRoutes.js";
+import orderRoutes from "./routes/orderRoutes.js";
+import reportRoutes from "./routes/reportRoutes.js";
+import dashboardRoutes from "./routes/dashboardRoutes.js";
 
 dotenv.config();
 
