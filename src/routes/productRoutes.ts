@@ -1,10 +1,10 @@
 import { Router } from "express";
-import Product from "../models/product";
+import Product from "../models/Product.js";
 import mongoose from "mongoose";
 import {
   createProductSchema,
   updateProductSchema,
-} from "../schemas/productSchemas";
+} from "../schemas/productSchemas.js";
 
 const router = Router();
 

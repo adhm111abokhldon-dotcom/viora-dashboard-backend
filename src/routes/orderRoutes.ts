@@ -6,8 +6,8 @@ import {
   updateOrderSchema,
   updateOrderStatusSchema,
 } from "../schemas/orderSchemas.js";
-import Order from "../models/Orders.ts";
-import Product from "../models/product.ts";
+import Order from "../models/Orders.js";
+import Product from "../models/Product.js";
 
 const router = Router();
 
