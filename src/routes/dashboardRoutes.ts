@@ -1,5 +1,11 @@
 import { Router } from "express";
 import Order from "../models/Orders.js";
+import {
+  BUSINESS_TIMEZONE,
+  DAY_MS,
+  businessDayLabel,
+  startOfDayInTimeZone,
+} from "../lib/date.js";
 
 
 const router = Router();
@@ -8,14 +14,20 @@ router.get("/", async (_req, res) => {
   try {
     const now = new Date();
 
-    const startOfToday = new Date(now);
-    startOfToday.setHours(0, 0, 0, 0);
+    /*
+     * "Today" is a Beirut business day, not a day in the server's timezone.
+     * Deriving these boundaries from the Node process clock
+     * (new Date().setHours(0, 0, 0, 0)) anchored "today" to the host:
+     * on a UTC server the window opened at 03:00 Beirut, so orders placed
+     * between midnight and 03:00 were excluded from today's KPIs and counted
+     * as yesterday instead — false zeros. Same helper used by /api/reports.
+     */
+    const startOfToday = startOfDayInTimeZone(now, BUSINESS_TIMEZONE);
 
-    const startOfYesterday = new Date(startOfToday);
-    startOfYesterday.setDate(startOfYesterday.getDate() - 1);
-
-    const startOfSevenDaysAgo = new Date(startOfToday);
-    startOfSevenDaysAgo.setDate(startOfSevenDaysAgo.getDate() - 6);
+    const startOfYesterday = startOfDayInTimeZone(
+      new Date(now.getTime() - DAY_MS),
+      BUSINESS_TIMEZONE,
+    );
 
     const [allOrders, todayOrders, yesterdayOrders, recentOrders] =
       await Promise.all([
@@ -73,12 +85,18 @@ router.get("/", async (_req, res) => {
 
     const salesData = [];
 
+    // 7 Beirut business days ending today (each bucket is a real
+    // midnight-to-midnight window in Asia/Beirut, not in the host timezone).
     for (let i = 0; i < 7; i++) {
-      const date = new Date(startOfSevenDaysAgo);
-      date.setDate(startOfSevenDaysAgo.getDate() + i);
+      const date = startOfDayInTimeZone(
+        new Date(now.getTime() - (6 - i) * DAY_MS),
+        BUSINESS_TIMEZONE,
+      );
 
-      const nextDate = new Date(date);
-      nextDate.setDate(date.getDate() + 1);
+      const nextDate = startOfDayInTimeZone(
+        new Date(now.getTime() - (5 - i) * DAY_MS),
+        BUSINESS_TIMEZONE,
+      );
 
       const dayOrders = allOrders.filter(
         (order) =>
@@ -90,9 +108,7 @@ router.get("/", async (_req, res) => {
       const sales = dayOrders.reduce((total, order) => total + order.total, 0);
 
       salesData.push({
-        date: date.toLocaleDateString("en-US", {
-          weekday: "short",
-        }),
+        date: businessDayLabel(date),
         sales,
       });
     }

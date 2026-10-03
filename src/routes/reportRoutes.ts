@@ -1,233 +1,221 @@
 import { Router } from "express";
 import Order from "../models/Orders.js";
-
+import {
+  BUSINESS_TIMEZONE as TIMEZONE,
+  DAY_MS,
+  startOfDayInTimeZone,
+} from "../lib/date.js";
 
 const router = Router();
 
-router.get("/", async (_req, res) => {
+/*
+ * The business runs on Beirut time. The day-boundary helpers come from
+ * ../lib/date.js so the dashboard and reports endpoints always agree on what
+ * "today" means.
+ */
+
+const dayKeyFormatter = new Intl.DateTimeFormat("en-CA", {
+  timeZone: TIMEZONE,
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
+
+const dayLabelFormatter = new Intl.DateTimeFormat("en-US", {
+  timeZone: TIMEZONE,
+  weekday: "short",
+});
+
+function dayKey(date: Date) {
+  return dayKeyFormatter.format(date);
+}
+
+router.get("/", async (req, res) => {
   try {
-    const activeOrders = {
-      $match: {
-        status: {
-          $ne: "Cancelled",
-        },
-      },
-    };
+    const range = req.query.range === "30" ? 30 : 7;
 
-    const [
-      summaryResult,
-      topProducts,
-      orderStatus,
-      salesData,
-      deliveredResult,
-    ] = await Promise.all([
-      Order.aggregate([
-        activeOrders,
-        {
-          $group: {
-            _id: null,
-            totalSales: { $sum: "$total" },
-            totalProfit: { $sum: "$profit" },
-            totalOrders: { $sum: 1 },
-          },
-        },
-      ]),
+    // Beirut midnight "today", expressed as a real UTC instant.
+    const startOfToday = startOfDayInTimeZone(new Date(), TIMEZONE);
 
-      Order.aggregate([
-        activeOrders,
-        {
-          $group: {
-            _id: "$productId",
-            name: { $first: "$product" },
-            orders: { $sum: 1 },
-            revenue: { $sum: "$total" },
-            profit: { $sum: "$profit" },
-          },
-        },
-        {
-          $sort: {
-            revenue: -1,
-          },
-        },
-        {
-          $limit: 5,
-        },
-        {
-          $project: {
-            _id: 0,
-            name: 1,
-            orders: 1,
-            revenue: 1,
-            profit: 1,
-          },
-        },
-      ]),
+    // First day of the window (range - 1 days ago, inclusive).
+    const startOfWindow = new Date(startOfToday.getTime() - (range - 1) * DAY_MS);
 
-      Order.aggregate([
-        {
-          $group: {
-            _id: "$status",
-            value: { $sum: 1 },
-          },
-        },
-        {
-          $project: {
-            _id: 0,
-            name: "$_id",
-            value: 1,
-          },
-        },
-      ]),
+    const activeOrders = { $match: { status: { $ne: "Cancelled" } } };
 
-      Order.aggregate([
-        {
-          $match: {
-            status: {
-              $ne: "Cancelled",
-            },
-            createdAt: {
-              $gte: new Date(
-                Date.now() - 7 * 24 * 60 * 60 * 1000,
-              ),
+    const [summaryResult, statusResult, salesResult, topProducts] =
+      await Promise.all([
+        /*
+         * Whole-order totals over every non-cancelled order.
+         * Delivery values stay separate from product revenue.
+         */
+        Order.aggregate([
+          activeOrders,
+          {
+            $group: {
+              _id: null,
+              totalSales: { $sum: "$total" },
+              totalProfit: { $sum: "$profit" },
+              deliveryRevenue: { $sum: "$deliveryCharged" },
+              deliveryCost: { $sum: "$deliveryCost" },
+              activeOrders: { $sum: 1 },
             },
           },
-        },
-        {
-          $group: {
-            _id: {
-              $dateToString: {
-                format: "%Y-%m-%d",
-                date: "$createdAt",
+        ]),
+
+        // Status distribution over every order.
+        Order.aggregate([{ $group: { _id: "$status", value: { $sum: 1 } } }]),
+
+        /*
+         * Daily sales/profit for the selected window, grouped by the
+         * Beirut calendar day.
+         */
+        Order.aggregate([
+          {
+            $match: {
+              status: { $ne: "Cancelled" },
+              createdAt: { $gte: startOfWindow },
+            },
+          },
+          {
+            $group: {
+              _id: {
+                $dateToString: {
+                  format: "%Y-%m-%d",
+                  date: "$createdAt",
+                  timezone: TIMEZONE,
+                },
+              },
+              sales: { $sum: "$total" },
+              profit: { $sum: "$profit" },
+            },
+          },
+          { $sort: { _id: 1 } },
+        ]),
+
+        /*
+         * Top products by revenue, using each item's historical
+         * unitPrice/unitCost snapshot.
+         */
+        Order.aggregate([
+          activeOrders,
+          { $unwind: "$items" },
+          {
+            $group: {
+              _id: "$items.productId",
+              name: { $first: "$items.name" },
+              units: { $sum: "$items.quantity" },
+              orders: { $sum: 1 },
+              revenue: {
+                $sum: { $multiply: ["$items.quantity", "$items.unitPrice"] },
+              },
+              profit: {
+                $sum: {
+                  $multiply: [
+                    "$items.quantity",
+                    { $subtract: ["$items.unitPrice", "$items.unitCost"] },
+                  ],
+                },
               },
             },
-            sales: {
-              $sum: "$total",
+          },
+          { $sort: { revenue: -1 } },
+          { $limit: 5 },
+          {
+            $project: {
+              _id: 0,
+              name: 1,
+              units: 1,
+              orders: 1,
+              revenue: 1,
+              profit: 1,
             },
-            profit: {
-              $sum: "$profit",
-            },
           },
+        ]),
+      ]);
+
+      const summary = summaryResult[0] ?? {
+        totalSales: 0,
+        totalProfit: 0,
+        deliveryRevenue: 0,
+        deliveryCost: 0,
+        activeOrders: 0,
+      };
+
+      const statusMap = new Map<string, number>(
+        statusResult.map((item) => [item._id, item.value]),
+      );
+
+      const pendingOrders = statusMap.get("Pending") ?? 0;
+      const deliveredOrders = statusMap.get("Delivered") ?? 0;
+      const cancelledOrders = statusMap.get("Cancelled") ?? 0;
+
+      const totalOrders = pendingOrders + deliveredOrders + cancelledOrders;
+
+      const averageOrderValue =
+        summary.activeOrders > 0 ? summary.totalSales / summary.activeOrders : 0;
+
+      const profitMargin =
+        summary.totalSales > 0
+          ? (summary.totalProfit / summary.totalSales) * 100
+          : 0;
+
+      const deliveryRate =
+        totalOrders > 0 ? (deliveredOrders / totalOrders) * 100 : 0;
+
+      const salesByDay = new Map<string, { sales: number; profit: number }>(
+        salesResult.map((item) => [
+          item._id,
+          { sales: item.sales, profit: item.profit },
+        ]),
+      );
+
+      /*
+       * Build the bucket list in the business timezone so the earliest day
+       * is fully included and empty days still appear on the chart.
+       */
+      const salesData = [];
+
+      for (let i = range - 1; i >= 0; i--) {
+        const date = new Date(startOfToday.getTime() - i * DAY_MS);
+        const key = dayKey(date);
+        const data = salesByDay.get(key);
+
+        salesData.push({
+          date: key,
+          day: dayLabelFormatter.format(date),
+          sales: data?.sales ?? 0,
+          profit: data?.profit ?? 0,
+        });
+      }
+
+      return res.status(200).json({
+        range,
+
+        summary: {
+          totalSales: summary.totalSales,
+          totalProfit: summary.totalProfit,
+          totalOrders,
+          activeOrders: summary.activeOrders,
+          averageOrderValue,
+          pendingOrders,
+          deliveredOrders,
+          cancelledOrders,
+          deliveryRevenue: summary.deliveryRevenue,
+          deliveryCost: summary.deliveryCost,
+          profitMargin,
+          deliveryRate,
         },
-        {
-          $sort: {
-            _id: 1,
-          },
-        },
-      ]),
 
-      Order.aggregate([
-        {
-          $match: {
-            status: "Delivered",
-          },
-        },
-        {
-          $count: "count",
-        },
-      ]),
-    ]);
+        salesData,
 
-    const summary = summaryResult[0] ?? {
-      totalSales: 0,
-      totalProfit: 0,
-      totalOrders: 0,
-    };
+        topProducts,
 
-    const deliveredOrders = deliveredResult[0]?.count ?? 0;
-
-    const averageOrderValue =
-      summary.totalOrders > 0
-        ? summary.totalSales / summary.totalOrders
-        : 0;
-
-    const deliveryRate =
-      summary.totalOrders > 0
-        ? (deliveredOrders / summary.totalOrders) * 100
-        : 0;
-
-    const profitMargin =
-      summary.totalSales > 0
-        ? (summary.totalProfit / summary.totalSales) * 100
-        : 0;
-
-    const dayNames = [
-      "Sun",
-      "Mon",
-      "Tue",
-      "Wed",
-      "Thu",
-      "Fri",
-      "Sat",
-    ];
-
-    const salesByDate = new Map(
-      salesData.map((item) => [
-        item._id,
-        {
-          sales: item.sales,
-          profit: item.profit,
-        },
-      ]),
-    );
-
-    const formattedSalesData = [];
-
-    for (let i = 6; i >= 0; i--) {
-      const date = new Date();
-
-      date.setDate(date.getDate() - i);
-
-      const dateKey = date.toISOString().split("T")[0];
-
-      const data = salesByDate.get(dateKey);
-
-      formattedSalesData.push({
-        day: dayNames[date.getDay()],
-        sales: data?.sales ?? 0,
-        profit: data?.profit ?? 0,
+        orderStatus: [
+          { name: "Delivered", value: deliveredOrders },
+          { name: "Pending", value: pendingOrders },
+          { name: "Cancelled", value: cancelledOrders },
+        ],
       });
-    }
-
-    const statusOrder = [
-      "Delivered",
-      "Pending",
-      "Cancelled",
-    ];
-
-    const statusMap = new Map(
-      orderStatus.map((item) => [
-        item.name,
-        item.value,
-      ]),
-    );
-
-    const formattedOrderStatus = statusOrder.map(
-      (status) => ({
-        name: status,
-        value: statusMap.get(status) ?? 0,
-      }),
-    );
-
-    return res.status(200).json({
-      summary: {
-        totalSales: summary.totalSales,
-        totalProfit: summary.totalProfit,
-        totalOrders: summary.totalOrders,
-        averageOrderValue,
-      },
-
-      salesData: formattedSalesData,
-
-      topProducts,
-
-      orderStatus: formattedOrderStatus,
-
-      snapshot: {
-        deliveredOrders,
-        deliveryRate,
-        profitMargin,
-      },
-    });
   } catch (error) {
     console.error("Failed to fetch reports:", error);
 

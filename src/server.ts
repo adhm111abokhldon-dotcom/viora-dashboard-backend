@@ -11,7 +11,7 @@ dotenv.config();
 
 const app = express();
 
-const PORT = process.env.PORT || 5000;
+const PORT = Number(process.env.PORT) || 5000;
 
 app.use(cors({ origin: process.env.FRONTEND_URL }));
 app.use(express.json());
@@ -35,8 +35,28 @@ app.use("/api/dashboard", dashboardRoutes);
 async function startServer() {
   await connectDB();
 
-  app.listen(PORT, "0.0.0.0", () => {
+  const server = app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
+    console.log(`API base: http://localhost:${PORT}/api`);
+  });
+
+  /*
+   * If another instance already holds the port, the old process would keep
+   * serving stale code while the new one silently does nothing. Fail loudly
+   * instead so the shadowed server is impossible to miss.
+   */
+  server.on("error", (error: NodeJS.ErrnoException) => {
+    if (error.code === "EADDRINUSE") {
+      console.error(
+        `Port ${PORT} is already in use — another backend instance is running ` +
+          `and would serve stale code. Stop it (e.g. kill the process using ` +
+          `port ${PORT}) and restart.`,
+      );
+    } else {
+      console.error("Server failed to start:", error);
+    }
+
+    process.exit(1);
   });
 }
 

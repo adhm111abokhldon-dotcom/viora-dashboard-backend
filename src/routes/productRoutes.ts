@@ -8,6 +8,11 @@ import {
 
 const router = Router();
 
+const escapeRegex = (text: string) =>
+  text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const LOW_STOCK_THRESHOLD = 10;
+
 router.get("/", async (req, res) => {
   try {
     const page = Math.max(Number(req.query.page) || 1, 1);
@@ -15,11 +20,43 @@ router.get("/", async (req, res) => {
 
     const skip = (page - 1) * limit;
 
-    const [products, totalProducts] = await Promise.all([
-      Product.find().sort({ createdAt: -1 }).skip(skip).limit(limit),
+    const search = String(req.query.search ?? "").trim();
 
-      Product.countDocuments(),
+    const filter = search
+      ? {
+          $or: [
+            { name: { $regex: escapeRegex(search), $options: "i" } },
+            { category: { $regex: escapeRegex(search), $options: "i" } },
+          ],
+        }
+      : {};
+
+    const [products, totalProducts, statsResult] = await Promise.all([
+      Product.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit),
+
+      Product.countDocuments(filter),
+
+      Product.aggregate([
+        {
+          $group: {
+            _id: null,
+            totalProducts: { $sum: 1 },
+            totalStock: { $sum: "$stock" },
+            lowStockCount: {
+              $sum: {
+                $cond: [{ $lte: ["$stock", LOW_STOCK_THRESHOLD] }, 1, 0],
+              },
+            },
+          },
+        },
+      ]),
     ]);
+
+    const stats = statsResult[0] ?? {
+      totalProducts: 0,
+      totalStock: 0,
+      lowStockCount: 0,
+    };
 
     const totalPages = Math.ceil(totalProducts / limit);
 
@@ -32,6 +69,11 @@ router.get("/", async (req, res) => {
         totalPages,
         hasNextPage: page < totalPages,
         hasPreviousPage: page > 1,
+      },
+      stats: {
+        totalProducts: stats.totalProducts,
+        totalStock: stats.totalStock,
+        lowStockCount: stats.lowStockCount,
       },
     });
   } catch (error) {
