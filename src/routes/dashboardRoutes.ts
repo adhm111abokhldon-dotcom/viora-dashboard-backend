@@ -1,5 +1,6 @@
 import { Router } from "express";
-import Order from "../models/Orders.js";
+import Order, { type IOrder, type IOrderItem } from "../models/Orders.js";
+import Product from "../models/Product.js";
 import {
   BUSINESS_TIMEZONE,
   DAY_MS,
@@ -7,8 +8,41 @@ import {
   startOfDayInTimeZone,
 } from "../lib/date.js";
 
-
 const router = Router();
+
+async function addProductImages(orders: IOrder[]) {
+  const productIds = [
+    ...new Set(
+      orders.flatMap((order) =>
+        order.items.map((item: IOrderItem) => item.productId.toString()),
+      ),
+    ),
+  ];
+
+  if (productIds.length === 0) {
+    return orders;
+  }
+
+  const products = await Product.find({
+    _id: { $in: productIds },
+  }).select("_id imageUrl");
+
+  const imageMap = new Map(
+    products.map((product) => [product._id.toString(), product.imageUrl]),
+  );
+
+  return orders.map((order) => {
+    const orderObject = order.toObject();
+
+    return {
+      ...orderObject,
+      items: orderObject.items.map((item: IOrderItem) => ({
+        ...item,
+        imageUrl: imageMap.get(item.productId.toString()),
+      })),
+    };
+  });
+}
 
 router.get("/", async (_req, res) => {
   try {
@@ -32,15 +66,18 @@ router.get("/", async (_req, res) => {
     const [allOrders, todayOrders, yesterdayOrders, recentOrders] =
       await Promise.all([
         Order.find().sort({ createdAt: -1 }),
+
         Order.find({
           createdAt: { $gte: startOfToday },
         }),
+
         Order.find({
           createdAt: {
             $gte: startOfYesterday,
             $lt: startOfToday,
           },
         }),
+
         Order.find().sort({ createdAt: -1 }).limit(10),
       ]);
 
@@ -127,6 +164,8 @@ router.get("/", async (_req, res) => {
 
     const totalOrders = allOrders.length;
 
+    const recentOrdersWithImages = await addProductImages(recentOrders);
+
     return res.status(200).json({
       stats: {
         todaySales,
@@ -157,7 +196,7 @@ router.get("/", async (_req, res) => {
         },
       ],
 
-      recentOrders,
+      recentOrders: recentOrdersWithImages,
       totalOrders,
     });
   } catch (error) {

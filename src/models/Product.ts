@@ -6,6 +6,7 @@ export interface IProduct extends Document {
   price: number;
   cost: number;
   stock: number;
+  imageUrl?: string;
 }
 
 const productSchema = new Schema<IProduct>(
@@ -36,9 +37,13 @@ const productSchema = new Schema<IProduct>(
 
     stock: {
       type: Number,
-      required: true,
       min: 0,
       default: 0,
+    },
+
+    imageUrl: {
+      type: String,
+      trim: true,
     },
   },
   {

@@ -14,6 +14,8 @@ export const createProductSchema = z
       .number()
       .int("Stock must be a whole number")
       .nonnegative("Stock cannot be negative"),
+
+    imageUrl: z.url("Image URL must be a valid URL").optional(),
   })
   .refine((data) => data.cost < data.price, {
     message: "Cost must be less than price",

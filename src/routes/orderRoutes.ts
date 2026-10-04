@@ -6,7 +6,10 @@ import {
   updateOrderSchema,
   updateOrderStatusSchema,
 } from "../schemas/orderSchemas.js";
-import Order, { type IOrderItem } from "../models/Orders.js";
+import Order, {
+  type IOrder,
+  type IOrderItem,
+} from "../models/Orders.js";
 import Product from "../models/Product.js";
 import { calcOrder } from "../lib/calcOrder.js";
 
@@ -146,6 +149,47 @@ function hasInvalidProductId(items: InputItem[]) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Add product images to order response                                       */
+/* -------------------------------------------------------------------------- */
+
+async function addProductImages(orders: IOrder[]) {
+  const productIds = [
+    ...new Set(
+      orders.flatMap((order) =>
+        order.items.map((item: IOrderItem) => item.productId.toString()),
+      ),
+    ),
+  ];
+
+  if (productIds.length === 0) {
+    return orders;
+  }
+
+  const products = await Product.find({
+    _id: { $in: productIds },
+  }).select("_id imageUrl");
+
+  const imageMap = new Map(
+    products.map((product) => [
+      product._id.toString(),
+      product.imageUrl,
+    ]),
+  );
+
+  return orders.map((order) => {
+    const orderObject = order.toObject();
+
+    return {
+      ...orderObject,
+      items: orderObject.items.map((item: IOrderItem) => ({
+        ...item,
+        imageUrl: imageMap.get(item.productId.toString()),
+      })),
+    };
+  });
+}
+
+/* -------------------------------------------------------------------------- */
 /* GET /api/orders                                                            */
 /* -------------------------------------------------------------------------- */
 
@@ -241,6 +285,8 @@ router.get("/", async (req, res) => {
       ]),
     ]);
 
+    const ordersWithImages = await addProductImages(orders);
+
     const totalPages = Math.ceil(totalOrders / limit);
 
     const stats = statsResult[0] ?? {
@@ -252,7 +298,7 @@ router.get("/", async (req, res) => {
     };
 
     return res.status(200).json({
-      orders,
+      orders: ordersWithImages,
 
       pagination: {
         currentPage: page,
@@ -296,7 +342,9 @@ router.get("/:id", async (req, res) => {
       });
     }
 
-    return res.status(200).json(order);
+    const [orderWithImage] = await addProductImages([order]);
+
+    return res.status(200).json(orderWithImage);
   } catch (error) {
     return fail(res, error, "Failed to fetch order");
   }
@@ -522,44 +570,22 @@ router.patch("/:id/status", async (req, res) => {
         throw new OrderError("Order already has this status");
       }
 
-      /*
-       * Allowed transitions:
-       *
-       * Pending   → Delivered
-       * Pending   → Cancelled
-       * Delivered → Cancelled
-       *
-       * Not allowed:
-       *
-       * Delivered → Pending
-       * Cancelled → Pending
-       * Cancelled → Delivered
-       */
-
-      // Pending → Delivered
-      // الطلب تسلّم لشركة الدليفري.
-      // المخزون لا يتغير.
       if (order.status === "Pending" && newStatus === "Delivered") {
         order.status = "Delivered";
       }
 
-      // Pending → Cancelled
-      // الطلب انلغى قبل تسليمه للدليفري.
-      // رجّع المخزون.
+  
       else if (order.status === "Pending" && newStatus === "Cancelled") {
         await releaseStock(order.items, session);
 
         order.status = "Cancelled";
       }
 
-      // Delivered → Cancelled
-      // الطلب كان مسلّم للدليفري لكن صار فيه مشكلة.
-      // لا نرجّع المخزون لأنه خرج من عندنا.
+  
       else if (order.status === "Delivered" && newStatus === "Cancelled") {
         order.status = "Cancelled";
       }
 
-      // أي انتقال آخر غير مسموح.
       else {
         throw new OrderError(
           `Cannot change order status from ${order.status} to ${newStatus}`,
