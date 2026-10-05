@@ -11,6 +11,10 @@ import {
   groupByProductAndOrder,
   rollupByProduct,
 } from "../lib/productStats.js";
+import {
+  getProductTotalsFrom,
+  startOfWindowForRange,
+} from "../lib/orderTotals.js";
 import { round2 } from "../lib/money.js";
 
 const router = Router();
@@ -45,7 +49,8 @@ router.get("/", async (req, res) => {
     const startOfToday = startOfDayInTimeZone(new Date(), TIMEZONE);
 
     // First day of the window (range - 1 days ago, inclusive).
-    const startOfWindow = new Date(startOfToday.getTime() - (range - 1) * DAY_MS);
+    // Shared with /api/advertising/insights so both pick the same days.
+    const startOfWindow = startOfWindowForRange(range);
 
     /*
      * Business rule: only Delivered orders are completed sales. Pending and
@@ -70,24 +75,9 @@ router.get("/", async (req, res) => {
         /*
          * Product-level totals over delivered orders in the window.
          * Product revenue excludes deliveryCharged, which is reported
-         * separately as deliveryRevenue.
+         * separately as deliveryRevenue. Shared with /advertising/insights.
          */
-        Order.aggregate([
-          inWindow,
-          ...itemPrologue(),
-          groupByProductAndOrder,
-          {
-            $group: {
-              _id: null,
-              productSales: { $sum: "$revenue" },
-              productCost: { $sum: "$cost" },
-              deliveryCost: { $sum: "$deliveryCost" },
-              productProfit: { $sum: "$profit" },
-              units: { $sum: "$units" },
-              deliveredOrders: { $sum: 1 },
-            },
-          },
-        ]),
+        getProductTotalsFrom(startOfWindow),
 
         // Status distribution over every order (operational view, all time).
         Order.aggregate([{ $group: { _id: "$status", value: { $sum: 1 } } }]),
@@ -161,26 +151,19 @@ router.get("/", async (req, res) => {
         ]),
       ]);
 
-    const summary = summaryResult[0] ?? {};
+    // summaryResult is already the totals object (see lib/orderTotals.ts).
+    const totals = summaryResult;
     const delivery = deliveryResult[0] ?? {};
     const ads = adsResult[0] ?? {};
 
-    const productSales = round2(summary.productSales ?? 0);
-    const productCost = round2(summary.productCost ?? 0);
-    const deliveryCost = round2(summary.deliveryCost ?? 0);
-    const productProfit = round2(summary.productProfit ?? 0);
+    const productSales = round2(totals.productSales);
+    const productCost = round2(totals.productCost);
+    const deliveryCost = round2(totals.deliveryCost);
+    const productProfit = round2(totals.productProfit);
+
+    // Manual and Windsor rows are both plain expenses, so a synced row is
+    // counted once, in the same total, with no extra filter.
     const advertisingSpend = round2(ads.total ?? 0);
-
-      const summaryDefaults = {
-        productSales: 0,
-        productCost: 0,
-        deliveryCost: 0,
-        productProfit: 0,
-        units: 0,
-        deliveredOrders: 0,
-      };
-
-      const totals = { ...summaryDefaults, ...summary };
 
       const statusMap = new Map<string, number>(
         statusResult.map((item: { _id: string; value: number }) => [
