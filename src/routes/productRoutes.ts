@@ -1,10 +1,16 @@
 import { Router } from "express";
 import Product from "../models/Product.js";
+import Order from "../models/Orders.js";
 import mongoose from "mongoose";
 import {
   createProductSchema,
   updateProductSchema,
 } from "../schemas/productSchemas.js";
+import {
+  performanceStages,
+  toPerformance,
+  type PerformanceRow,
+} from "./productStatsRoutes.js";
 
 const router = Router();
 
@@ -58,10 +64,40 @@ router.get("/", async (req, res) => {
       lowStockCount: 0,
     };
 
+    /*
+     * Business performance for the products on THIS page only, in a single
+     * aggregation (no N+1). Uses the shared productStats logic and counts
+     * Delivered orders as the only completed sales.
+     */
+    const performanceRows = await Order.aggregate(
+      performanceStages(products.map((product) => product._id)),
+    );
+
+    const performanceByProduct = new Map<string, PerformanceRow>(
+      performanceRows.map((row) => [row._id.toString(), row]),
+    );
+
     const totalPages = Math.ceil(totalProducts / limit);
 
     return res.status(200).json({
-      products,
+      products: products.map((product) => {
+        const item = product.toObject();
+        const performance = toPerformance(
+          performanceByProduct.get(item._id.toString()),
+        );
+
+        return {
+          ...item,
+          performance: {
+            ...performance,
+
+            /* Realised margin at the price customers actually paid, as
+               opposed to `price - cost` which ignores negotiation. */
+            realisedMargin:
+              performance.sales - performance.cost - performance.deliveryCost,
+          },
+        };
+      }),
       pagination: {
         currentPage: page,
         limit,

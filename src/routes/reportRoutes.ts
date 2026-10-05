@@ -1,10 +1,17 @@
 import { Router } from "express";
 import Order from "../models/Orders.js";
+import AdvertisingExpense from "../models/AdvertisingExpense.js";
 import {
   BUSINESS_TIMEZONE as TIMEZONE,
   DAY_MS,
   startOfDayInTimeZone,
 } from "../lib/date.js";
+import {
+  itemPrologue,
+  groupByProductAndOrder,
+  rollupByProduct,
+} from "../lib/productStats.js";
+import { round2 } from "../lib/money.js";
 
 const router = Router();
 
@@ -40,30 +47,61 @@ router.get("/", async (req, res) => {
     // First day of the window (range - 1 days ago, inclusive).
     const startOfWindow = new Date(startOfToday.getTime() - (range - 1) * DAY_MS);
 
-    const activeOrders = { $match: { status: { $ne: "Cancelled" } } };
+    /*
+     * Business rule: only Delivered orders are completed sales. Pending and
+     * Cancelled never contribute to revenue, cost or profit.
+     */
 
-    const [summaryResult, statusResult, salesResult, topProducts] =
+    /* Every figure below is scoped to the selected window so the 7/30-day
+       toggle changes the whole page, not just the chart. */
+    const inWindow = {
+      $match: { status: "Delivered", createdAt: { $gte: startOfWindow } },
+    };
+
+    const [
+      summaryResult,
+      statusResult,
+      deliveryResult,
+      salesResult,
+      topProducts,
+      adsResult,
+    ] =
       await Promise.all([
         /*
-         * Whole-order totals over every non-cancelled order.
-         * Delivery values stay separate from product revenue.
+         * Product-level totals over delivered orders in the window.
+         * Product revenue excludes deliveryCharged, which is reported
+         * separately as deliveryRevenue.
          */
         Order.aggregate([
-          activeOrders,
+          inWindow,
+          ...itemPrologue(),
+          groupByProductAndOrder,
           {
             $group: {
               _id: null,
-              totalSales: { $sum: "$total" },
-              totalProfit: { $sum: "$profit" },
-              deliveryRevenue: { $sum: "$deliveryCharged" },
+              productSales: { $sum: "$revenue" },
+              productCost: { $sum: "$cost" },
               deliveryCost: { $sum: "$deliveryCost" },
-              activeOrders: { $sum: 1 },
+              productProfit: { $sum: "$profit" },
+              units: { $sum: "$units" },
+              deliveredOrders: { $sum: 1 },
             },
           },
         ]),
 
-        // Status distribution over every order.
+        // Status distribution over every order (operational view, all time).
         Order.aggregate([{ $group: { _id: "$status", value: { $sum: 1 } } }]),
+
+        /* Delivery money collected vs. paid, in the window. */
+        Order.aggregate([
+          inWindow,
+          {
+            $group: {
+              _id: null,
+              deliveryRevenue: { $sum: "$deliveryCharged" },
+            },
+          },
+        ]),
 
         /*
          * Daily sales/profit for the selected window, grouped by the
@@ -72,7 +110,7 @@ router.get("/", async (req, res) => {
         Order.aggregate([
           {
             $match: {
-              status: { $ne: "Cancelled" },
+              status: "Delivered",
               createdAt: { $gte: startOfWindow },
             },
           },
@@ -93,98 +131,15 @@ router.get("/", async (req, res) => {
         ]),
 
         /*
-         * Top products by revenue, using each item's historical
-         * unitPrice/unitCost snapshot.
-         *
-         * Profit here is delivery-INCLUSIVE so it reconciles with the
-         * Summary's totalProfit (which sums order.profit =
-         * total - itemsCost - deliveryCost).
-         *
-         * An order's net delivery (deliveryCharged - deliveryCost) is not
-         * attributable to any single product, so it is split across the
-         * order's items proportionally to each item's revenue:
-         *   share      = itemRevenue / itemsTotal
-         *                  (or 1 / itemCount when itemsTotal = 0)
-         *   itemProfit = qty * (unitPrice - unitCost) + netDelivery * share
-         *
-         * Summing itemProfit over an order therefore yields exactly the
-         * stored order.profit. itemsTotal / itemCount / netDelivery are
-         * computed at the ORDER level before $unwind, because after $unwind
-         * they no longer exist.
+         * Top products by product revenue, using each item's historical
+         * unitPrice/unitCost snapshot. Delivery cost is allocated across the
+         * order's items (see lib/productStats.ts).
          */
         Order.aggregate([
-          activeOrders,
-          {
-            $set: {
-              __itemsTotal: {
-                $sum: {
-                  $map: {
-                    input: { $ifNull: ["$items", []] },
-                    as: "line",
-                    in: {
-                      $multiply: ["$$line.quantity", "$$line.unitPrice"],
-                    },
-                  },
-                },
-              },
-              __itemsCount: {
-                $size: { $ifNull: ["$items", []] },
-              },
-              __netDelivery: {
-                $subtract: [
-                  { $ifNull: ["$deliveryCharged", 0] },
-                  { $ifNull: ["$deliveryCost", 0] },
-                ],
-              },
-            },
-          },
-          { $unwind: "$items" },
-          {
-            $set: {
-              __itemRevenue: {
-                $multiply: ["$items.quantity", "$items.unitPrice"],
-              },
-            },
-          },
-          {
-            $set: {
-              __share: {
-                $cond: [
-                  { $gt: ["$__itemsTotal", 0] },
-                  { $divide: ["$__itemRevenue", "$__itemsTotal"] },
-                  {
-                    $cond: [
-                      { $gt: ["$__itemsCount", 0] },
-                      { $divide: [1, "$__itemsCount"] },
-                      0,
-                    ],
-                  },
-                ],
-              },
-            },
-          },
-          {
-            $group: {
-              _id: "$items.productId",
-              name: { $first: "$items.name" },
-              units: { $sum: "$items.quantity" },
-              orders: { $sum: 1 },
-              revenue: { $sum: "$__itemRevenue" },
-              profit: {
-                $sum: {
-                  $add: [
-                    {
-                      $multiply: [
-                        "$items.quantity",
-                        { $subtract: ["$items.unitPrice", "$items.unitCost"] },
-                      ],
-                    },
-                    { $multiply: ["$__netDelivery", "$__share"] },
-                  ],
-                },
-              },
-            },
-          },
+          inWindow,
+          ...itemPrologue(),
+          groupByProductAndOrder,
+          rollupByProduct,
           { $sort: { revenue: -1 } },
           { $limit: 5 },
           {
@@ -193,23 +148,45 @@ router.get("/", async (req, res) => {
               name: 1,
               units: 1,
               orders: 1,
-              revenue: 1,
+              revenue: { $round: ["$revenue", 2] },
               profit: { $round: ["$profit", 2] },
             },
           },
         ]),
+
+        /* Advertising spend inside the same window. */
+        AdvertisingExpense.aggregate([
+          { $match: { date: { $gte: startOfWindow } } },
+          { $group: { _id: null, total: { $sum: "$amount" }, count: { $sum: 1 } } },
+        ]),
       ]);
 
-      const summary = summaryResult[0] ?? {
-        totalSales: 0,
-        totalProfit: 0,
-        deliveryRevenue: 0,
+    const summary = summaryResult[0] ?? {};
+    const delivery = deliveryResult[0] ?? {};
+    const ads = adsResult[0] ?? {};
+
+    const productSales = round2(summary.productSales ?? 0);
+    const productCost = round2(summary.productCost ?? 0);
+    const deliveryCost = round2(summary.deliveryCost ?? 0);
+    const productProfit = round2(summary.productProfit ?? 0);
+    const advertisingSpend = round2(ads.total ?? 0);
+
+      const summaryDefaults = {
+        productSales: 0,
+        productCost: 0,
         deliveryCost: 0,
-        activeOrders: 0,
+        productProfit: 0,
+        units: 0,
+        deliveredOrders: 0,
       };
 
+      const totals = { ...summaryDefaults, ...summary };
+
       const statusMap = new Map<string, number>(
-        statusResult.map((item) => [item._id, item.value]),
+        statusResult.map((item: { _id: string; value: number }) => [
+          item._id,
+          item.value,
+        ]),
       );
 
       const pendingOrders = statusMap.get("Pending") ?? 0;
@@ -218,21 +195,36 @@ router.get("/", async (req, res) => {
 
       const totalOrders = pendingOrders + deliveredOrders + cancelledOrders;
 
-      const averageOrderValue =
-        summary.activeOrders > 0 ? summary.totalSales / summary.activeOrders : 0;
+      const deliveredInWindow = totals.deliveredOrders ?? 0;
 
-      const profitMargin =
-        summary.totalSales > 0
-          ? (summary.totalProfit / summary.totalSales) * 100
-          : 0;
+      const averageOrderValue =
+        deliveredInWindow > 0 ? productSales / deliveredInWindow : 0;
+
+      const profitMargin = productSales > 0 ? (productProfit / productSales) * 100 : 0;
 
       const deliveryRate =
         totalOrders > 0 ? (deliveredOrders / totalOrders) * 100 : 0;
 
+      const deliveryCollected = round2(delivery.deliveryRevenue ?? 0);
+
+      /*
+       * The money view, in the order the business actually spends it:
+       *   Product Sales
+       *   - Product Cost
+       *   - Delivery Cost
+       *   = Product Profit
+       *   - Advertising Spend
+       *   = Net Profit After Ads
+       *
+       * deliveryCharged is reported separately as "delivery collected" and is
+       * deliberately excluded from Product Sales.
+       */
+      const netProfitAfterAds = round2(productProfit - advertisingSpend);
+
       const salesByDay = new Map<string, { sales: number; profit: number }>(
-        salesResult.map((item) => [
+        salesResult.map((item: { _id: string; sales: number; profit: number }) => [
           item._id,
-          { sales: item.sales, profit: item.profit },
+          { sales: round2(item.sales), profit: round2(item.profit) },
         ]),
       );
 
@@ -258,19 +250,50 @@ router.get("/", async (req, res) => {
       return res.status(200).json({
         range,
 
+        /*
+         * All figures below describe COMPLETED sales (Delivered orders) inside
+         * the selected window. Order Status stays an all-time operational view.
+         */
         summary: {
-          totalSales: summary.totalSales,
-          totalProfit: summary.totalProfit,
+          productSales,
+          productCost,
+          deliveryCost,
+          productProfit,
+          unitsSold: totals.units,
+
+          /* Delivered orders INSIDE the window - the completed sales figure. */
+          deliveredOrdersInRange: deliveredInWindow,
+          averageOrderValue: round2(averageOrderValue),
+          profitMargin,
+          advertisingSpend,
+
+          /* Operational view: every order ever, regardless of window. */
           totalOrders,
-          activeOrders: summary.activeOrders,
-          averageOrderValue,
           pendingOrders,
           deliveredOrders,
           cancelledOrders,
-          deliveryRevenue: summary.deliveryRevenue,
-          deliveryCost: summary.deliveryCost,
-          profitMargin,
+
+          deliveryCollected,
+          deliveryNet: round2(deliveryCollected - deliveryCost),
           deliveryRate,
+        },
+
+        /*
+         * Where the money goes. Advertising lives here only - it is never mixed
+         * into historical order or product calculations.
+         */
+        financials: {
+          productSales,
+          productCost,
+          deliveryCost,
+          productProfit,
+          deliveryCollected,
+          advertisingSpend,
+          advertisingCount: ads.count ?? 0,
+          netProfitAfterAds,
+          netMargin: productSales > 0
+            ? round2((netProfitAfterAds / productSales) * 100)
+            : 0,
         },
 
         salesData,

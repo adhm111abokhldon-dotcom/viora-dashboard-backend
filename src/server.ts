@@ -6,6 +6,8 @@ import productRoutes from "./routes/productRoutes.js";
 import orderRoutes from "./routes/orderRoutes.js";
 import reportRoutes from "./routes/reportRoutes.js";
 import dashboardRoutes from "./routes/dashboardRoutes.js";
+import advertisingRoutes from "./routes/advertisingRoutes.js";
+import productStatsRoutes from "./routes/productStatsRoutes.js";
 
 dotenv.config();
 
@@ -28,9 +30,13 @@ app.get("/api/health", (_req, res) => {
   });
 });
 app.use("/api/products", productRoutes);
+// "/api/products/:id/stats" has two segments, so productRoutes' single-segment
+// "/:id" handler cannot swallow it; Express simply falls through.
+app.use("/api/products", productStatsRoutes);
 app.use("/api/orders", orderRoutes);
 app.use("/api/reports", reportRoutes);
 app.use("/api/dashboard", dashboardRoutes);
+app.use("/api/advertising", advertisingRoutes);
 
 async function startServer() {
   await connectDB();
