@@ -95,24 +95,91 @@ router.get("/", async (req, res) => {
         /*
          * Top products by revenue, using each item's historical
          * unitPrice/unitCost snapshot.
+         *
+         * Profit here is delivery-INCLUSIVE so it reconciles with the
+         * Summary's totalProfit (which sums order.profit =
+         * total - itemsCost - deliveryCost).
+         *
+         * An order's net delivery (deliveryCharged - deliveryCost) is not
+         * attributable to any single product, so it is split across the
+         * order's items proportionally to each item's revenue:
+         *   share      = itemRevenue / itemsTotal
+         *                  (or 1 / itemCount when itemsTotal = 0)
+         *   itemProfit = qty * (unitPrice - unitCost) + netDelivery * share
+         *
+         * Summing itemProfit over an order therefore yields exactly the
+         * stored order.profit. itemsTotal / itemCount / netDelivery are
+         * computed at the ORDER level before $unwind, because after $unwind
+         * they no longer exist.
          */
         Order.aggregate([
           activeOrders,
+          {
+            $set: {
+              __itemsTotal: {
+                $sum: {
+                  $map: {
+                    input: { $ifNull: ["$items", []] },
+                    as: "line",
+                    in: {
+                      $multiply: ["$$line.quantity", "$$line.unitPrice"],
+                    },
+                  },
+                },
+              },
+              __itemsCount: {
+                $size: { $ifNull: ["$items", []] },
+              },
+              __netDelivery: {
+                $subtract: [
+                  { $ifNull: ["$deliveryCharged", 0] },
+                  { $ifNull: ["$deliveryCost", 0] },
+                ],
+              },
+            },
+          },
           { $unwind: "$items" },
+          {
+            $set: {
+              __itemRevenue: {
+                $multiply: ["$items.quantity", "$items.unitPrice"],
+              },
+            },
+          },
+          {
+            $set: {
+              __share: {
+                $cond: [
+                  { $gt: ["$__itemsTotal", 0] },
+                  { $divide: ["$__itemRevenue", "$__itemsTotal"] },
+                  {
+                    $cond: [
+                      { $gt: ["$__itemsCount", 0] },
+                      { $divide: [1, "$__itemsCount"] },
+                      0,
+                    ],
+                  },
+                ],
+              },
+            },
+          },
           {
             $group: {
               _id: "$items.productId",
               name: { $first: "$items.name" },
               units: { $sum: "$items.quantity" },
               orders: { $sum: 1 },
-              revenue: {
-                $sum: { $multiply: ["$items.quantity", "$items.unitPrice"] },
-              },
+              revenue: { $sum: "$__itemRevenue" },
               profit: {
                 $sum: {
-                  $multiply: [
-                    "$items.quantity",
-                    { $subtract: ["$items.unitPrice", "$items.unitCost"] },
+                  $add: [
+                    {
+                      $multiply: [
+                        "$items.quantity",
+                        { $subtract: ["$items.unitPrice", "$items.unitCost"] },
+                      ],
+                    },
+                    { $multiply: ["$__netDelivery", "$__share"] },
                   ],
                 },
               },
@@ -127,7 +194,7 @@ router.get("/", async (req, res) => {
               units: 1,
               orders: 1,
               revenue: 1,
-              profit: 1,
+              profit: { $round: ["$profit", 2] },
             },
           },
         ]),
