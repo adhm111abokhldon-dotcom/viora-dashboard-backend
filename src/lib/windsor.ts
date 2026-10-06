@@ -377,7 +377,8 @@ async function fetchConnection(config: ConnectionConfig): Promise<ConnectionResu
 
   if (!apiKey) {
     throw new WindsorError(
-      `${config.label} is not configured (set ${config.envKeys[0]})`,
+      // Never leak env-var names in a message the UI shows to the owner.
+      `${config.label} is not connected yet`,
       503,
       config.id,
     );
