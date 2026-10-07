@@ -12,6 +12,7 @@ import Order, {
 } from "../models/Orders.js";
 import Product from "../models/Product.js";
 import { calcOrder } from "../lib/calcOrder.js";
+import { nextOrderNumber } from "../lib/orderNumber.js";
 
 const router = Router();
 
@@ -379,9 +380,14 @@ router.post("/", async (req, res) => {
 
       const { total, profit } = calcOrder(lines, deliveryCharged, deliveryCost);
 
+      // Stable business number (#1, #2, ...) allocated atomically inside the
+      // same transaction - a rollback releases the number too.
+      const orderNumber = await nextOrderNumber(session);
+
       const [created] = await Order.create(
         [
           {
+            orderNumber,
             customer,
             phone,
             items: lines,

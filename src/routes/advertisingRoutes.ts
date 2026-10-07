@@ -4,23 +4,35 @@ import type { QueryFilter } from "mongoose";
 import AdvertisingExpense, {
   type IAdvertisingExpense,
 } from "../models/AdvertisingExpense.js";
+import Order from "../models/Orders.js";
 import {
   createAdvertisingExpenseSchema,
   updateAdvertisingExpenseSchema,
 } from "../schemas/advertisingSchemas.js";
-import { round2 } from "../lib/money.js";
-import {
-  AED_PER_USD,
-  AED_PER_USD_LABEL,
-  aedToUsd,
-  WINDSOR_SOURCE_CURRENCY,
-} from "../lib/currency.js";
 import {
   WindsorError,
   externalKeyFor,
   fetchAllWindsorData,
   legacyExternalKeyFor,
 } from "../lib/windsor.js";
+import {
+  AED_PER_USD_LABEL,
+  WINDSOR_SOURCE_CURRENCY,
+  aedToUsd,
+} from "../lib/currency.js";
+
+import {
+  BUSINESS_TIMEZONE as TIMEZONE,
+  DAY_MS,
+  startOfDayInTimeZone,
+  startOfBusinessDay,
+  dayKeyFormatter,
+} from "../lib/date.js";
+import { round2 } from "../lib/money.js";
+import {
+  getProductTotalsFrom,
+  startOfWindowForRange,
+} from "../lib/orderTotals.js";
 
 import {
   ALL_ACCOUNT_KEYS,
@@ -30,6 +42,96 @@ import {
   resolveBusinessAccount,
   type BusinessAccountKey,
 } from "../lib/adAccounts.js";
+import Product from "../models/Product.js";
+
+/** Translates a plain-English verdict key into the app's localised copy.
+ *
+ * Server-side nodes have no locale, and the same English copy lives in
+ * messages/en.json and messages/ar.json keyed identically, so the pages
+ * can translate the verdict text with the existing `useTranslations`
+ * dictionary without the backend knowing about i18n.
+ *
+ * @param key English message key inside the "advertising" namespace.
+ */
+function advertisingT(key: string): string {
+  const dict: Record<string, string> = {
+    "verdictReason.noAdSpend": "No ad spend was recorded in this period.",
+    "verdictReason.noProfitBaseline":
+      "There is no positive profit in this period to compare against.",
+    "verdictReason.noDeliveredOrders":
+      "There are no delivered orders in this period yet.",
+    "verdictNext.scale":
+      "Ads cost less than half of what each order earns. Safe to increase the budget.",
+    "verdictNext.watch":
+      "Ads cost between half and all of each order's profit. Keep watching before scaling.",
+    "verdictNext.losing":
+      "Ads cost more than each order earns. Pause them or fix the campaigns first.",
+    "breakEvenMessage": "Break-even per order: {amount}",
+  };
+
+  return dict[key] ?? key;
+}
+
+/** Business-account bucket -> Windsor ad-account key for the window. */
+function accountBucketToKey(bucket: BusinessAccountKey): string {
+  switch (bucket) {
+    case "viora":
+      return "viora";
+    case "trendora_facebook":
+      return "trendora_facebook";
+    case "trendora_instagram":
+      return "trendora_instagram";
+    default:
+      return "trendora_other";
+  }
+}
+
+/**
+ * Per-account spend/messages for the window, resolved through the business
+ * account directory (same as /advertising/insights).
+ */
+async function resolveWindowAccounts(
+  windowStart: Date,
+): Promise<
+  Array<{
+    key: BusinessAccountKey;
+    spend: number;
+    messages: number;
+    accountId: string | null;
+    accountStatus: string;
+  }>
+> {
+  const rows = await AdvertisingExpense.find({
+    date: { $gte: windowStart },
+    source: "windsor",
+  }).lean();
+
+  const buckets = new Map<BusinessAccountKey, { spend: number; messages: number }>(
+    BUSINESS_ACCOUNT_KEYS.map((k) => [k, { spend: 0, messages: 0 }]),
+  );
+
+  for (const row of rows as Array<{
+    store: string | null;
+    accountId: string | null;
+    amount: number;
+    messages?: number;
+  }>) {
+    const key = resolveBusinessAccount(row.store, row.accountId);
+    const bucket = buckets.get(key);
+    if (bucket) {
+      bucket.spend += row.amount;
+      bucket.messages += row.messages ?? 0;
+    }
+  }
+
+  return ALL_ACCOUNT_KEYS.filter((key) => buckets.has(key)).map((key) => ({
+    key,
+    spend: round2((buckets.get(key) ?? { spend: 0, messages: 0 }).spend),
+    messages: Math.round((buckets.get(key) ?? { spend: 0, messages: 0 }).messages),
+    accountId: null,
+    accountStatus: "",
+  }));
+}
 
 const router = Router();
 
@@ -939,6 +1041,386 @@ router.get("/insights", async (_req, res) => {
     console.error("Failed to fetch advertising insights:", error);
 
     return res.status(500).json({ message: "Failed to fetch insights" });
+  }
+});
+
+/* -------------------------------------------------------------------------- */
+/* GET /api/advertising/:id/products - products linked to this campaign       */
+/* -------------------------------------------------------------------------- */
+
+router.get("/:id/products", async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.id)) {
+    return res.status(400).json({ message: "Invalid campaign ID" });
+  }
+
+  const campaignId = new mongoose.Types.ObjectId(req.params.id);
+
+  try {
+    const campaign = await AdvertisingExpense.findById(campaignId).lean();
+
+    if (!campaign) {
+      return res.status(404).json({ message: "Campaign not found" });
+    }
+
+    /*
+      Ad campaigns are IMPLICIT because there is no campaign collection:
+      a campaign is (store, accountId, campaignName) rows in
+      advertisingexpenses. A campaign collection would need to be frozen in
+      time to be safe (rename/merge = audit disaster), so everything reads
+      from advertisingexpenses - the same source the historical report uses
+      and the same place owners update.
+    */
+    const key = campaignKeyFor(
+      campaign.store,
+      campaign.accountId ?? "",
+      campaign.campaign ?? "",
+    );
+
+    const products = await Product.find({
+      "campaigns.key": key,
+    })
+      .select("name category imageUrl price stock")
+      .lean();
+
+    const productsWithLinks = products.map((product) => {
+      const ref = (product.campaigns ?? []).find(
+        (c) => c.key === key,
+      );
+
+      return {
+        product: {
+          _id: product._id.toString(),
+          name: product.name,
+          category: product.category,
+          imageUrl: product.imageUrl ?? null,
+          price: product.price,
+          cost: product.cost,
+          stock: product.stock,
+        },
+        linkedAt: campaign.createdAt,
+        link: ref
+          ? { key: ref.key, store: ref.store, accountId: ref.accountId, campaign: ref.campaign }
+          : null,
+      };
+    });
+
+    return res.status(200).json({
+      campaign: {
+        _id: campaign._id.toString(),
+        store: campaign.store,
+        accountId: campaign.accountId,
+        campaign: campaign.campaign,
+        accountName: campaign.accountName,
+        platform: campaign.platform,
+        createdAt: campaign.createdAt,
+        updatedAt: campaign.updatedAt,
+      },
+      products: productsWithLinks,
+    });
+  } catch (error) {
+    console.error("Failed to fetch campaign products:", error);
+
+    return res.status(500).json({
+      message: "Failed to fetch campaign products",
+    });
+  }
+});
+
+/* -------------------------------------------------------------------------- */
+/* GET /api/advertising/:id/products - products linked to this campaign       */
+/* -------------------------------------------------------------------------- */
+
+router.get("/:id/products", async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.id)) {
+    return res.status(400).json({ message: "Invalid campaign ID" });
+  }
+
+  const campaignId = new mongoose.Types.ObjectId(req.params.id);
+
+  try {
+    const campaign = await AdvertisingExpense.findById(campaignId).lean();
+
+    if (!campaign) {
+      return res.status(404).json({ message: "Campaign not found" });
+    }
+
+    /*
+      Ad campaigns are IMPLICIT because there is no campaign collection:
+      a campaign is (store, accountId, campaignName) rows in
+      advertisingexpenses. A campaign collection would need to be frozen in
+      time to be safe (rename/merge = audit disaster), so everything reads
+      from advertisingexpenses - the same source the historical report uses
+      and the same place owners update.
+    */
+    const key = campaignKeyFor(
+      campaign.store,
+      campaign.accountId ?? "",
+      campaign.campaign ?? "",
+    );
+
+    const products = await Product.find({
+      "campaigns.key": key,
+    })
+      .select("name category imageUrl price stock")
+      .lean();
+
+    const productsWithLinks = products.map((product) => {
+      const ref = (product.campaigns ?? []).find(
+        (c) => c.key === key,
+      );
+
+      return {
+        product: {
+          _id: product._id.toString(),
+          name: product.name,
+          category: product.category,
+          imageUrl: product.imageUrl ?? null,
+          price: product.price,
+          cost: product.cost,
+          stock: product.stock,
+        },
+        linkedAt: campaign.createdAt,
+        link: ref
+          ? { key: ref.key, store: ref.store, accountId: ref.accountId, campaign: ref.campaign }
+          : null,
+      };
+    });
+
+    return res.status(200).json({
+      campaign: {
+        _id: campaign._id.toString(),
+        store: campaign.store,
+        accountId: campaign.accountId,
+        campaign: campaign.campaign,
+        accountName: campaign.accountName,
+        platform: campaign.platform,
+        createdAt: campaign.createdAt,
+        updatedAt: campaign.updatedAt,
+      },
+      products: productsWithLinks,
+    });
+  } catch (error) {
+    console.error("Failed to fetch campaign products:", error);
+
+    return res.status(500).json({
+      message: "Failed to fetch campaign products",
+    });
+  }
+});
+
+
+/**
+ * POST /api/advertising/performance
+ *
+ * Period-scoped ad analytics behind the Advertising page's funnel and
+ * performance verdicts. `range` is `7` or `30` and selects the Beirut
+ * business window (same helper as the reports endpoint), so the verdicts
+ * always answer "for the last N days".
+ *
+ *   - delivered orders / product profit come from Delivered orders only;
+ *   - ad spend and messages come from every stored advertising row in the
+ *     window (manual + Windsor, counted exactly once each);
+ *   - the verdict compares cost-per-order against profit-per-order, so the
+ *     owner sees at a glance whether the ads are paying for themselves.
+ */
+router.post("/performance", async (req, res) => {
+  try {
+    const range = Number(req.query.range);
+    const parsedRange = range === 7 || range === 30 ? range : 7;
+
+    // Beirut midnight "today", expressed as a real UTC instant.
+    const startOfToday = startOfDayInTimeZone(new Date(), TIMEZONE);
+
+    // First day of the window (range - 1 days ago, inclusive).
+    const startOfWindow = startOfWindowForRange(parsedRange);
+
+    /* ------------------------------------------------------------------ */
+    /* Delivered orders in the window (product sales + profit).           */
+    /* ------------------------------------------------------------------ */
+    const orderAgg = await Order.aggregate([
+      {
+        $match: {
+          status: "Delivered",
+          createdAt: { $gte: startOfWindow },
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          deliveredOrders: { $sum: 1 },
+          productSales: { $sum: "$total" },
+          productProfit: { $sum: "$profit" },
+        },
+      },
+    ]);
+
+    const orders = orderAgg[0] ?? {
+      deliveredOrders: 0,
+      productSales: 0,
+      productProfit: 0,
+    };
+
+    /* ------------------------------------------------------------------ */
+    /* Advertising rows in the window (manual + Windsor, exactly once).   */
+    /* ------------------------------------------------------------------ */
+    const advertisingAgg = await AdvertisingExpense.aggregate([
+      { $match: { date: { $gte: startOfWindow } } },
+      {
+        $group: {
+          _id: null,
+          spend: { $sum: "$amount" },
+          messages: { $sum: { $ifNull: ["$messages", 0] } },
+        },
+      },
+    ]);
+
+    const ads = advertisingAgg[0] ?? { spend: 0, messages: 0 };
+
+    const accountAgg = await AdvertisingExpense.aggregate([
+      { $match: { date: { $gte: startOfWindow } } },
+      {
+        $group: {
+          _id: { store: "$store", accountId: "$accountId" },
+          spend: { $sum: "$amount" },
+          messages: { $sum: { $ifNull: ["$messages", 0] } },
+        },
+      },
+      { $sort: { spend: -1, _id: 1 } },
+    ]);
+
+    const buckets = new Map<BusinessAccountKey, { spend: number; messages: number }>(
+      BUSINESS_ACCOUNT_KEYS.map((k) => [k, { spend: 0, messages: 0 }]),
+    );
+
+    for (const row of accountAgg as Array<{
+      _id: { store: string | null; accountId: string | null };
+      spend: number;
+      messages: number;
+    }>) {
+      const key = resolveBusinessAccount(row._id.store, row._id.accountId);
+      const bucket = buckets.get(key);
+      if (bucket) {
+        bucket.spend += row.spend;
+        bucket.messages += row.messages;
+      }
+    }
+
+    const accounts = ALL_ACCOUNT_KEYS.filter((key) => buckets.has(key)).map(
+      (key) => ({
+        key,
+        spend: round2((buckets.get(key) ?? { spend: 0, messages: 0 }).spend),
+        messages: Math.round((buckets.get(key) ?? { spend: 0, messages: 0 }).messages),
+        accountId: null,
+        accountStatus: "",
+      }),
+    );
+
+    const dailyAdSpend = new Map<string, number>();
+    const dailyAdMessages = new Map<string, number>();
+
+    const dailyRows = await AdvertisingExpense.find({
+      date: { $gte: startOfWindow },
+    }).lean();
+
+    for (const row of dailyRows as Array<{
+      date?: Date | string;
+      amount: number;
+      messages?: number;
+    }>) {
+      if (row.date) {
+        const date =
+          typeof row.date === "string" ? new Date(row.date) : row.date;
+        if (!Number.isNaN(date.getTime())) {
+          const key = dayKeyFormatter.format(date);
+          dailyAdSpend.set(
+            key,
+            round2((dailyAdSpend.get(key) ?? 0) + Number(row.amount)),
+          );
+          dailyAdMessages.set(
+            key,
+            (dailyAdMessages.get(key) ?? 0) + Number(row.messages ?? 0),
+          );
+        }
+      }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Verdict: is the advertising paying for itself?                     */
+    /* ------------------------------------------------------------------ */
+    // Cost per delivered order vs. profit per delivered order. Both come
+    // back as null (not NaN/Infinity) when a denominator is zero.
+    const profitPerOrder = roundedRatio(
+      orders.productProfit,
+      orders.deliveredOrders,
+    );
+    const costPerOrder = roundedRatio(ads.spend, orders.deliveredOrders);
+
+    let verdict: "scale" | "watch" | "losing" | "noData" = "noData";
+    let reason: "noAdSpend" | "noProfitBaseline" | "noDeliveredOrders" | null =
+      null;
+
+    if (ads.spend === 0) {
+      verdict = "noData";
+      reason = "noAdSpend";
+    } else if (orders.productProfit <= 0) {
+      verdict = "noData";
+      reason = "noProfitBaseline";
+    } else if (orders.deliveredOrders === 0) {
+      verdict = "noData";
+      reason = "noDeliveredOrders";
+    } else if (costPerOrder === null || profitPerOrder === null) {
+      verdict = "noData";
+      reason = "noProfitBaseline";
+    } else if (costPerOrder < profitPerOrder / 2) {
+      // Ads cost less than half of what each order earns -> safe to scale.
+      verdict = "scale";
+    } else if (costPerOrder <= profitPerOrder) {
+      // Ads cost between half and all of each order's profit.
+      verdict = "watch";
+    } else {
+      // Ads cost more than each order earns.
+      verdict = "losing";
+    }
+
+    return res.status(200).json({
+      range: parsedRange,
+      summary: {
+        deliveredOrders: orders.deliveredOrders,
+        productSales: round2(orders.productSales),
+        productProfit: round2(orders.productProfit),
+        adSpend: round2(ads.spend),
+        adMessages: ads.messages,
+        adCount: await AdvertisingExpense.countDocuments({
+          date: { $gte: startOfWindow },
+        }),
+      },
+      financials: {
+        productSales: round2(orders.productSales),
+        productProfit: round2(orders.productProfit),
+        adSpend: round2(ads.spend),
+        adMessages: ads.messages,
+        netProfitAfterAds: round2(orders.productProfit - ads.spend),
+      },
+      verdict: {
+        type: verdict,
+        reason,
+        costPerOrder,
+        profitPerOrder,
+        breakEvenPerOrder: roundedRatio(ads.spend, orders.productProfit),
+        adSpentPerMessage: roundedRatio(ads.spend, ads.messages),
+      },
+      accounts,
+      dailyAdSpend: [...dailyAdSpend.entries()]
+        .map(([date, spend]) => ({ date, spend }))
+        .sort((a, b) => a.date.localeCompare(b.date)),
+      dailyAdMessages: [...dailyAdMessages.entries()]
+        .map(([date, messages]) => ({ date, messages }))
+        .sort((a, b) => a.date.localeCompare(b.date)),
+      availableTo: dayKeyFormatter.format(startOfToday),
+    });
+  } catch (error) {
+    console.error("Failed to fetch ad performance:", error);
+    return res.status(500).json({ message: "Failed to fetch ad performance" });
   }
 });
 

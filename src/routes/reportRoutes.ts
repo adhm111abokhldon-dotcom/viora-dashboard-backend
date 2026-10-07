@@ -43,7 +43,10 @@ function dayKey(date: Date) {
 
 router.get("/", async (req, res) => {
   try {
-    const range = req.query.range === "30" ? 30 : 7;
+    const range =
+      typeof req.query.range === "string" && (req.query.range === "7" || req.query.range === "30")
+        ? Number(req.query.range)
+        : 7;
 
     // Beirut midnight "today", expressed as a real UTC instant.
     const startOfToday = startOfDayInTimeZone(new Date(), TIMEZONE);

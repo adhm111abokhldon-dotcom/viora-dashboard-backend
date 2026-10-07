@@ -87,3 +87,8 @@ const dayLabelFormatter = new Intl.DateTimeFormat("en-US", {
 export function businessDayLabel(date: Date): string {
   return dayLabelFormatter.format(date);
 }
+
+/** ISO day key (`YYYY-MM-DD`) for the business day containing `date`. */
+export const dayKeyFormatter = new Intl.DateTimeFormat("en-CA", {
+  timeZone: BUSINESS_TIMEZONE,
+});

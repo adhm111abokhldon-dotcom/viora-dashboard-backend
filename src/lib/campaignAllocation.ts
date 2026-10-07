@@ -1,0 +1,59 @@
+import { round2 } from "./money.js";
+
+/**
+ * Advertising cost allocation: a campaign's total spend is divided EQUALLY
+ * between its linked products.
+ *
+ *   Product Campaign Share = Campaign Total Spend / Number of Linked Products
+ *
+ * Allocation is ANALYTICAL ONLY - it never changes the campaign's own spend.
+ * A $100 campaign with two products still spent $100 on the Advertising page;
+ * each product is simply charged $50 for profitability purposes.
+ *
+ * Rounding: money is split in CENTS so the shares always reconcile EXACTLY
+ * to the campaign spend - no cent is ever lost or created. The remainder
+ * cents go to the LAST entries of the sorted list (deterministic, and the
+ * same order every caller uses: sorted product ids).
+ *
+ *   $100 over 3 -> [33.33, 33.33, 33.34]  (sum = 100.00 exactly)
+ */
+
+/**
+ * Split `total` into `count` equal shares that sum EXACTLY to `total`.
+ *
+ * Returns [] for count <= 0 (a campaign with no linked products has no
+ * allocation - never divides by zero).
+ */
+export function allocateEvenly(total: number, count: number): number[] {
+  if (count <= 0) return [];
+  if (count === 1) return [round2(total)];
+
+  const totalCents = Math.round(total * 100);
+  const baseCents = Math.floor(totalCents / count);
+  const remainder = totalCents - baseCents * count;
+
+  return Array.from({ length: count }, (_, index) => {
+    // The last `remainder` entries each carry one extra cent.
+    const cents =
+      index >= count - remainder ? baseCents + 1 : baseCents;
+
+    return cents / 100;
+  });
+}
+
+/**
+ * This product's share of one campaign's spend.
+ *
+ * `index` is the product's position in the campaign's SORTED linked-product
+ * list - every endpoint sorts by product id ascending first, so the
+ * product-facing number and the campaign-facing table always agree.
+ */
+export function allocatedShareAt(
+  total: number,
+  count: number,
+  index: number,
+): number {
+  if (index < 0 || index >= count) return 0;
+
+  return allocateEvenly(total, count)[index] ?? 0;
+}
