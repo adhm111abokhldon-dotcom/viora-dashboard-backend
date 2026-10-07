@@ -5,6 +5,7 @@ import AdvertisingExpense from "../models/AdvertisingExpense.js";
 import mongoose from "mongoose";
 import {
   createProductSchema,
+  campaignLinkSchema,
   updateProductSchema,
 } from "../schemas/productSchemas.js";
 import {
@@ -20,9 +21,11 @@ import {
   campaignKeyFor,
   isIgnoredAccount,
   resolveBusinessAccount,
+  type StoreId,
 } from "../lib/adAccounts.js";
 import { allocateEvenly } from "../lib/campaignAllocation.js";
 import { round2 } from "../lib/money.js";
+import { calculateProductProfit } from "../lib/productProfit.js";
 
 const router = Router();
 
@@ -100,6 +103,9 @@ router.get("/", async (req, res) => {
 
         return {
           ...item,
+          campaigns: (item.campaigns ?? []).filter(
+            (ref) => !isIgnoredAccount(ref.accountId),
+          ),
           performance: {
             ...performance,
 
@@ -149,7 +155,11 @@ router.get("/:id", async (req, res) => {
       });
     }
 
-    return res.status(200).json(product);
+    const safeProduct = product.toObject();
+    safeProduct.campaigns = safeProduct.campaigns.filter(
+      (ref) => !isIgnoredAccount(ref.accountId),
+    );
+    return res.status(200).json(safeProduct);
   } catch (error) {
     console.error("Failed to fetch product:", error);
 
@@ -168,71 +178,237 @@ router.get("/:id/performance", async (req, res) => {
     return res.status(400).json({ message: "Invalid product ID" });
   }
 
-  const productId = new mongoose.Types.ObjectId(req.params.id);
-
-  const page = Math.max(Number(req.query.page) || 1, 1);
-  const limit = Math.min(Math.max(Number(req.query.limit) || 10, 1), 100);
-  const skip = (page - 1) * limit;
+  const requestedPage = Number(req.query.page ?? 1);
+  const requestedLimit = Number(req.query.limit ?? 10);
+  if (
+    !Number.isSafeInteger(requestedPage) ||
+    requestedPage < 1 ||
+    !Number.isSafeInteger(requestedLimit) ||
+    requestedLimit < 1 ||
+    requestedLimit > 100 ||
+    !Number.isSafeInteger((requestedPage - 1) * requestedLimit)
+  ) {
+    return res.status(400).json({ message: "Invalid pagination parameters" });
+  }
 
   const rawStatus =
     typeof req.query.status === "string" ? req.query.status : "Delivered";
-  const statusFilter =
-    rawStatus === "all" ||
-    rawStatus === "Pending" ||
-    rawStatus === "Cancelled" ||
-    rawStatus === "Delivered"
-      ? rawStatus
-      : "Delivered";
+  if (
+    !["all", "Pending", "Cancelled", "Delivered"].includes(rawStatus)
+  ) {
+    return res.status(400).json({ message: "Invalid order status filter" });
+  }
+
+  const productId = new mongoose.Types.ObjectId(req.params.id);
+  const page = requestedPage;
+  const limit = requestedLimit;
+  const skip = (page - 1) * limit;
+  const statusFilter = rawStatus;
 
   try {
-    const campaignRefs = [...(product.campaigns ?? [])]
-      .sort((a, b) => a.key.localeCompare(b.key))
-      .filter((ref) => !isIgnoredAccount(ref.accountId));
+    const product = await Product.findById(productId).lean();
+    if (!product) {
+      return res.status(404).json({ message: "Product not found" });
+    }
 
+    const campaignRefs = [
+      ...new Map(
+        (product.campaigns ?? [])
+          .filter((ref) => !isIgnoredAccount(ref.accountId))
+          .map((ref) => [ref.key, ref]),
+      ).values(),
+    ].sort((a, b) => a.key.localeCompare(b.key));
     const refKeys = campaignRefs.map((ref) => ref.key);
-    const linkedIdsByKey = new Map<string, string[]>();
-    if (refKeys.length > 0) {
-      const linked = await Product.find({
-        "campaigns.key": { $in: refKeys },
-      })
-        .select("_id campaigns.key")
-        .lean();
 
-      for (const row of linked as Array<{
-        _id: mongoose.Types.ObjectId;
-        campaigns: { key: string }[];
-      }>) {
-        for (const ref of row.campaigns) {
-          const key = ref.key;
-          if (!linkedIdsByKey.has(key)) linkedIdsByKey.set(key, []);
-          const ids = linkedIdsByKey.get(key) ?? [];
-          ids.push(row._id.toString());
-        }
-      }
+    type SalesTotals = {
+      orders: number;
+      units: number;
+      revenue: number;
+      productCost: number;
+      deliveryCost: number;
+    };
+    type StatusTotal = { _id: string; orders: number; units: number };
+    type OrderRow = {
+      _id: mongoose.Types.ObjectId;
+      orderNumber?: number;
+      createdAt: Date;
+      status: string;
+      quantity: number;
+      revenue: number;
+      cost: number;
+    };
+    type CampaignSpend = {
+      _id: { store: StoreId; accountId: string; campaign: string };
+      spend: number;
+      messages: number;
+      clicks: number;
+      platform: string;
+      accountName?: string;
+    };
+    type LinkedProduct = {
+      _id: mongoose.Types.ObjectId;
+      campaigns: { key: string }[];
+    };
 
-      for (const ids of linkedIdsByKey.values()) {
-        ids.sort();
+    const baseItemStages = [
+      ...itemPrologue(),
+      { $match: { "items.productId": productId } },
+      groupByProductAndOrder,
+    ];
+    const statusMatch =
+      statusFilter === "all" ? [] : [{ $match: { status: statusFilter } }];
+
+    const [salesRows, statusRows, orderResults, spendRows, linkedRows] =
+      await Promise.all([
+        Order.aggregate<SalesTotals>([
+          { $match: { status: "Delivered", "items.productId": productId } },
+          ...baseItemStages,
+          {
+            $group: {
+              _id: null,
+              orders: { $sum: 1 },
+              units: { $sum: "$units" },
+              revenue: { $sum: "$revenue" },
+              productCost: { $sum: "$cost" },
+              deliveryCost: { $sum: "$deliveryCost" },
+            },
+          },
+        ]),
+        Order.aggregate<StatusTotal>([
+          { $match: { "items.productId": productId } },
+          ...baseItemStages,
+          {
+            $group: {
+              _id: "$status",
+              orders: { $sum: 1 },
+              units: { $sum: "$units" },
+            },
+          },
+        ]),
+        Order.aggregate<{ rows: OrderRow[]; total: { count: number }[] }>([
+          { $match: { "items.productId": productId } },
+          ...baseItemStages,
+          ...statusMatch,
+          {
+            $facet: {
+              rows: [
+                { $sort: { createdAt: -1, _id: -1 } },
+                { $skip: skip },
+                { $limit: limit },
+                {
+                  $project: {
+                    _id: "$_id.orderId",
+                    orderNumber: 1,
+                    createdAt: 1,
+                    status: 1,
+                    quantity: "$units",
+                    revenue: 1,
+                    cost: 1,
+                  },
+                },
+              ],
+              total: [{ $count: "count" }],
+            },
+          },
+        ]),
+        refKeys.length > 0
+          ? AdvertisingExpense.aggregate<CampaignSpend>([
+              {
+                $match: {
+                  source: "windsor",
+                  accountId: { $nin: ["1783521163010511"] },
+                  $or: campaignRefs.map((ref) => ({
+                    store: ref.store,
+                    accountId: ref.accountId,
+                    campaign: ref.campaign,
+                  })),
+                },
+              },
+              {
+                $group: {
+                  _id: {
+                    store: "$store",
+                    accountId: "$accountId",
+                    campaign: "$campaign",
+                  },
+                  spend: { $sum: "$amount" },
+                  messages: { $sum: { $ifNull: ["$messages", 0] } },
+                  clicks: { $sum: { $ifNull: ["$clicks", 0] } },
+                  platform: { $first: "$platform" },
+                  accountName: { $first: "$accountName" },
+                },
+              },
+            ])
+          : Promise.resolve([] as CampaignSpend[]),
+        refKeys.length > 0
+          ? Product.find({ "campaigns.key": { $in: refKeys } })
+              .select("_id campaigns.key")
+              .lean<LinkedProduct[]>()
+          : Promise.resolve([] as LinkedProduct[]),
+      ]);
+
+    const sales = salesRows[0] ?? {
+      orders: 0,
+      units: 0,
+      revenue: 0,
+      productCost: 0,
+      deliveryCost: 0,
+    };
+    const statusByName = new Map(statusRows.map((row) => [row._id, row]));
+    const orderResult = orderResults[0] ?? { rows: [], total: [] };
+    const totalOrderRows = orderResult.total[0]?.count ?? 0;
+
+    const productIdsByCampaign = new Map<string, Set<string>>(
+      refKeys.map((key) => [key, new Set<string>()]),
+    );
+    for (const row of linkedRows) {
+      for (const ref of row.campaigns) {
+        productIdsByCampaign.get(ref.key)?.add(row._id.toString());
       }
     }
 
-    const totalAllocated = round2(
+    const spendByKey = new Map(
+      spendRows.map((row) => [
+        campaignKeyFor(row._id.store, row._id.accountId, row._id.campaign),
+        row,
+      ]),
+    );
+    const campaigns = campaignRefs.map((ref) => {
+      const linkedIds = [
+        ...(productIdsByCampaign.get(ref.key) ?? new Set([productId.toString()])),
+      ].sort();
+      const spend = spendByKey.get(ref.key);
+      const businessAccount = resolveBusinessAccount(ref.store, ref.accountId);
+
+      return {
+        key: ref.key,
+        store: ref.store,
+        accountId: ref.accountId,
+        accountKey: businessAccount,
+        accountName: spend?.accountName ?? businessAccount,
+        campaign: ref.campaign,
+        platform: spend?.platform ?? "Meta",
+        spend: round2(spend?.spend ?? 0),
+        messages: spend?.messages ?? 0,
+        clicks: spend?.clicks ?? 0,
+        linkedProductCount: linkedIds.length,
+        allocation:
+          allocateEvenly(spend?.spend ?? 0, linkedIds.length)[
+            linkedIds.indexOf(productId.toString())
+          ] ?? 0,
+      };
+    });
+    const advertisingCost = round2(
       campaigns.reduce((sum, campaign) => sum + campaign.allocation, 0),
     );
-
-    /* Profit waterfall - every line traceable to a source section above. */
-    const beforeAdsProfit = round2(revenue - soldCost - allocatedDeliveryCost);
-    const netProfit = round2(beforeAdsProfit - totalAllocated);
-    const marginPercent = revenue > 0 ? round2((netProfit / revenue) * 100) : 0;
-
-    const state: "noSales" | "profitable" | "loss" | "breakEven" =
-      deliveredOrders === 0 && totalAllocated === 0
-        ? "noSales"
-        : netProfit > 0
-          ? "profitable"
-          : netProfit < 0
-            ? "loss"
-            : "breakEven";
-
+    const profit = calculateProductProfit(
+      sales.revenue,
+      sales.productCost,
+      sales.deliveryCost,
+      advertisingCost,
+      sales.orders,
+    );
+    const totalOrders = statusRows.reduce((sum, row) => sum + row.orders, 0);
     const totalPages = Math.ceil(totalOrderRows / limit);
 
     return res.status(200).json({
@@ -245,61 +421,43 @@ router.get("/:id/performance", async (req, res) => {
         cost: product.cost,
         stock: product.stock,
       },
-
       overview: {
         campaignCount: campaignRefs.length,
         totalOrders,
-        unitsSold,
+        unitsSold: sales.units,
         outOfStock: product.stock === 0,
         lowStock: product.stock > 0 && product.stock <= LOW_STOCK_THRESHOLD,
       },
-
       sales: {
-        deliveredOrders,
-        unitsSold,
-        revenue,
-        productCost: soldCost,
-        deliveryCost: allocatedDeliveryCost,
-        averageSellingPrice: unitsSold > 0 ? round2(revenue / unitsSold) : 0,
-        pendingOrders: pending.orderCount ?? 0,
-        pendingUnits: pending.units ?? 0,
-        cancelledOrders: cancelled.orderCount ?? 0,
-        cancelledUnits: cancelled.units ?? 0,
+        deliveredOrders: sales.orders,
+        unitsSold: sales.units,
+        revenue: round2(sales.revenue),
+        productCost: round2(sales.productCost),
+        deliveryCost: round2(sales.deliveryCost),
+        averageSellingPrice:
+          sales.units > 0 ? round2(sales.revenue / sales.units) : 0,
+        pendingOrders: statusByName.get("Pending")?.orders ?? 0,
+        pendingUnits: statusByName.get("Pending")?.units ?? 0,
+        cancelledOrders: statusByName.get("Cancelled")?.orders ?? 0,
+        cancelledUnits: statusByName.get("Cancelled")?.units ?? 0,
       },
-
       inventory: {
         currentStock: product.stock,
         costPerUnit: round2(product.cost),
         inventoryValue: round2(product.stock * product.cost),
       },
-
       campaigns,
-      advertising: { totalAllocated },
-
+      advertising: { totalAllocated: advertisingCost },
       profit: {
-        revenue,
-        productCost: soldCost,
-        deliveryCost: allocatedDeliveryCost,
-        advertisingCost: totalAllocated,
-        beforeAdsProfit,
-        netProfit,
-        marginPercent,
-        state,
+        revenue: round2(sales.revenue),
+        productCost: round2(sales.productCost),
+        deliveryCost: round2(sales.deliveryCost),
+        advertisingCost,
+        ...profit,
       },
-
       orders: {
         status: statusFilter,
-        rows: (
-          orderRows as Array<{
-            _id: mongoose.Types.ObjectId;
-            orderNumber?: number;
-            createdAt: Date;
-            status: string;
-            quantity: number;
-            revenue: number;
-            cost: number;
-          }> | undefined
-        ).map((row) => ({
+        rows: orderResult.rows.map((row) => ({
           orderNumber: row.orderNumber ?? null,
           orderId: row._id.toString(),
           createdAt: row.createdAt,
@@ -307,7 +465,6 @@ router.get("/:id/performance", async (req, res) => {
           quantity: row.quantity,
           revenue: round2(row.revenue),
           cost: round2(row.cost),
-          /* Effective historical price for this order (snapshots). */
           unitPrice: row.quantity > 0 ? round2(row.revenue / row.quantity) : 0,
           unitCost: row.quantity > 0 ? round2(row.cost / row.quantity) : 0,
         })),
@@ -323,10 +480,9 @@ router.get("/:id/performance", async (req, res) => {
     });
   } catch (error) {
     console.error("Failed to fetch product performance:", error);
-
-    return res.status(500).json({
-      message: "Failed to fetch product performance",
-    });
+    return res
+      .status(500)
+      .json({ message: "Failed to fetch product performance" });
   }
 });
 
@@ -385,7 +541,11 @@ router.put("/:id", async (req, res) => {
       });
     }
 
-    return res.status(200).json(product);
+    const safeProduct = product.toObject();
+    safeProduct.campaigns = safeProduct.campaigns.filter(
+      (ref) => !isIgnoredAccount(ref.accountId),
+    );
+    return res.status(200).json(safeProduct);
   } catch (error) {
     console.error("Failed to update product:", error);
 
@@ -412,7 +572,9 @@ router.get("/:id/campaigns", async (req, res) => {
     }
 
     // Deterministic order; schema transform already dedupes by key.
-    const refs = [...(product.campaigns ?? [])].sort((a, b) =>
+    const refs = (product.campaigns ?? [])
+      .filter((ref) => !isIgnoredAccount(ref.accountId))
+      .sort((a, b) =>
       a.key.localeCompare(b.key),
     );
 
@@ -440,48 +602,27 @@ router.post("/:id/campaigns", async (req, res) => {
     return res.status(400).json({ message: "Invalid product ID" });
   }
 
-  const result = createProductSchema.safeParse(req.body);
+  const result = campaignLinkSchema.safeParse(req.body);
 
   if (!result.success) {
     return res.status(400).json({
-      message: "Invalid product data",
+      message: "Invalid campaign reference",
       errors: result.error.issues,
     });
   }
 
-  const { store, accountId, campaign } = result.data;
-
-  // Server-side derivation protects the relationship from tampered or
-  // stale keys - the only canonical identity is key = store|account|campaign.
-  const key = campaignKeyFor(store, accountId, campaign);
+  const campaignRef = result.data;
 
   try {
-    const product = await Product.findById(req.params.id);
-
-    if (!product) {
-      return res.status(404).json({ message: "Product not found" });
-    }
-
-    // Remove stale links (wrong account/campaign) and keep the new one.
     const updated = await Product.findByIdAndUpdate(
       req.params.id,
-      {
-        $set: {
-          campaigns: [
-            ...new Map(
-              [
-                ...product.campaigns.filter(
-                  (ref) =>
-                    !(ref.store === store && ref.accountId === accountId),
-                ),
-                { key, store, accountId, campaign },
-              ].map((ref) => [ref.key, ref]),
-            ).values(),
-          ],
-        },
-      },
+      { $addToSet: { campaigns: campaignRef } },
       { new: true, runValidators: true },
     );
+
+    if (!updated) {
+      return res.status(404).json({ message: "Product not found" });
+    }
 
     return res.status(200).json({
       product: { _id: updated._id.toString(), name: updated.name, category: updated.category },
@@ -503,33 +644,27 @@ router.delete("/:id/campaigns", async (req, res) => {
     return res.status(400).json({ message: "Invalid product ID" });
   }
 
-  const { store, accountId, campaign } = req.body ?? {};
-
-  if (typeof store !== "string" || typeof accountId !== "string" || typeof campaign !== "string") {
-    return res.status(400).json({ message: "store, accountId and campaign are required" });
+  const result = campaignLinkSchema.safeParse(req.body);
+  if (!result.success) {
+    return res.status(400).json({
+      message: "Invalid campaign reference",
+      errors: result.error.issues,
+    });
   }
 
   try {
-    const product = await Product.findById(req.params.id);
-
-    if (!product) {
-      return res.status(404).json({ message: "Product not found" });
-    }
-
-    const filtered = (product.campaigns ?? []).filter(
-      (ref) =>
-        !(ref.store === store && ref.accountId === accountId && ref.campaign === campaign),
-    );
-
-    if (filtered.length === (product.campaigns?.length ?? 0)) {
-      return res.status(404).json({ message: "Campaign link not found" });
-    }
-
-    const updated = await Product.findByIdAndUpdate(
-      req.params.id,
-      { $set: { campaigns: filtered } },
+    const updated = await Product.findOneAndUpdate(
+      { _id: req.params.id, "campaigns.key": result.data.key },
+      { $pull: { campaigns: { key: result.data.key } } },
       { new: true, runValidators: true },
     );
+
+    if (!updated) {
+      if (await Product.exists({ _id: req.params.id })) {
+        return res.status(404).json({ message: "Campaign link not found" });
+      }
+      return res.status(404).json({ message: "Product not found" });
+    }
 
     return res.status(200).json({
       product: { _id: updated._id.toString(), name: updated.name, category: updated.category },

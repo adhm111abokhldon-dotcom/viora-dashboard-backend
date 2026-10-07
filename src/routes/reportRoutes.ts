@@ -16,6 +16,7 @@ import {
   startOfWindowForRange,
 } from "../lib/orderTotals.js";
 import { round2 } from "../lib/money.js";
+import { excludeIgnoredAccountsFilter } from "../lib/adAccounts.js";
 
 const router = Router();
 
@@ -43,27 +44,28 @@ function dayKey(date: Date) {
 
 router.get("/", async (req, res) => {
   try {
-    const range =
-      typeof req.query.range === "string" && (req.query.range === "7" || req.query.range === "30")
-        ? Number(req.query.range)
-        : 7;
+    const range: "all" | 7 | 30 =
+      req.query.range === "7" ? 7 : req.query.range === "30" ? 30 : "all";
 
     // Beirut midnight "today", expressed as a real UTC instant.
     const startOfToday = startOfDayInTimeZone(new Date(), TIMEZONE);
 
     // First day of the window (range - 1 days ago, inclusive).
     // Shared with /api/advertising/insights so both pick the same days.
-    const startOfWindow = startOfWindowForRange(range);
+    const startOfWindow =
+      range === "all" ? undefined : startOfWindowForRange(range);
 
     /*
      * Business rule: only Delivered orders are completed sales. Pending and
      * Cancelled never contribute to revenue, cost or profit.
      */
 
-    /* Every figure below is scoped to the selected window so the 7/30-day
-       toggle changes the whole page, not just the chart. */
+    /* The default is all historical data; optional windows are user selected. */
     const inWindow = {
-      $match: { status: "Delivered", createdAt: { $gte: startOfWindow } },
+      $match: {
+        status: "Delivered",
+        ...(startOfWindow ? { createdAt: { $gte: startOfWindow } } : {}),
+      },
     };
 
     const [
@@ -101,12 +103,9 @@ router.get("/", async (req, res) => {
          * Beirut calendar day.
          */
         Order.aggregate([
-          {
-            $match: {
-              status: "Delivered",
-              createdAt: { $gte: startOfWindow },
-            },
-          },
+          inWindow,
+          ...itemPrologue(),
+          groupByProductAndOrder,
           {
             $group: {
               _id: {
@@ -116,7 +115,7 @@ router.get("/", async (req, res) => {
                   timezone: TIMEZONE,
                 },
               },
-              sales: { $sum: "$total" },
+              sales: { $sum: "$revenue" },
               profit: { $sum: "$profit" },
             },
           },
@@ -149,7 +148,12 @@ router.get("/", async (req, res) => {
 
         /* Advertising spend inside the same window. */
         AdvertisingExpense.aggregate([
-          { $match: { date: { $gte: startOfWindow } } },
+          {
+            $match: {
+              ...(startOfWindow ? { date: { $gte: startOfWindow } } : {}),
+              ...excludeIgnoredAccountsFilter(),
+            },
+          },
           { $group: { _id: null, total: { $sum: "$amount" }, count: { $sum: 1 } } },
         ]),
       ]);
@@ -220,17 +224,31 @@ router.get("/", async (req, res) => {
        */
       const salesData = [];
 
-      for (let i = range - 1; i >= 0; i--) {
-        const date = new Date(startOfToday.getTime() - i * DAY_MS);
-        const key = dayKey(date);
-        const data = salesByDay.get(key);
+      if (range === "all") {
+        for (const [key, data] of [...salesByDay.entries()].sort(([a], [b]) =>
+          a.localeCompare(b),
+        )) {
+          const date = new Date(`${key}T12:00:00Z`);
+          salesData.push({
+            date: key,
+            day: dayLabelFormatter.format(date),
+            sales: data.sales,
+            profit: data.profit,
+          });
+        }
+      } else {
+        for (let i = range - 1; i >= 0; i--) {
+          const date = new Date(startOfToday.getTime() - i * DAY_MS);
+          const key = dayKey(date);
+          const data = salesByDay.get(key);
 
-        salesData.push({
-          date: key,
-          day: dayLabelFormatter.format(date),
-          sales: data?.sales ?? 0,
-          profit: data?.profit ?? 0,
-        });
+          salesData.push({
+            date: key,
+            day: dayLabelFormatter.format(date),
+            sales: data?.sales ?? 0,
+            profit: data?.profit ?? 0,
+          });
+        }
       }
 
       return res.status(200).json({

@@ -4,6 +4,43 @@ import Order from "../models/Orders.js";
 
 const COUNTER_ID = "orderNumber";
 
+function isDuplicateKeyError(error: unknown): error is { code: number } {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === 11000
+  );
+}
+
+/** Initialize or advance the counter to cover every previously assigned number. */
+export async function ensureOrderNumberCounter(): Promise<void> {
+  const [highest] = await Order.aggregate<{ value: number }>([
+    { $match: { orderNumber: { $type: "number" } } },
+    { $group: { _id: null, value: { $max: "$orderNumber" } } },
+  ]);
+
+  try {
+    const counter = await Counter.findOneAndUpdate(
+      { _id: COUNTER_ID },
+      { $max: { seq: highest?.value ?? 0 } },
+      { new: true, upsert: true, setDefaultsOnInsert: true },
+    );
+
+    if (!counter) throw new Error("Failed to initialize the order-number counter");
+  } catch (error) {
+    if (!isDuplicateKeyError(error)) throw error;
+
+    const counter = await Counter.findOneAndUpdate(
+      { _id: COUNTER_ID },
+      { $max: { seq: highest?.value ?? 0 } },
+      { new: true },
+    );
+
+    if (!counter) throw new Error("Failed to initialize the order-number counter");
+  }
+}
+
 /**
  * Next sequential business order number (1, 2, 3, ...).
  *
@@ -18,30 +55,17 @@ const COUNTER_ID = "orderNumber";
  * already assigned so new orders always continue from the top.
  */
 export async function nextOrderNumber(session?: ClientSession): Promise<number> {
-  const existing = await Counter.findById(COUNTER_ID).session(session ?? null);
-
-  if (!existing) {
-    const highest = await Order.findOne({ orderNumber: { $ne: null } })
-      .sort({ orderNumber: -1 })
-      .select("orderNumber")
-      .session(session ?? null);
-
-    try {
-      await Counter.create(
-        [{ _id: COUNTER_ID, seq: highest?.orderNumber ?? 0 }],
-        session ? { session } : {},
-      );
-    } catch {
-      // Another transaction seeded it first - the unique _id lost the race
-      // harmlessly; the $inc below picks up whichever value won.
-    }
-  }
-
   const counter = await Counter.findByIdAndUpdate(
     COUNTER_ID,
     { $inc: { seq: 1 } },
-    { new: true, upsert: true, session },
+    { new: true, session },
   );
+
+  if (!counter) {
+    throw new Error(
+      "Order-number counter is missing; initialize it before creating orders",
+    );
+  }
 
   return counter.seq;
 }

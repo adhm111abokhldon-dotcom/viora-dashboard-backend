@@ -9,6 +9,12 @@ import {
 } from "../lib/date.js";
 
 const router = Router();
+const dayKeyFormatter = new Intl.DateTimeFormat("en-CA", {
+  timeZone: BUSINESS_TIMEZONE,
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
 
 async function addProductImages(orders: IOrder[]) {
   const productIds = [
@@ -63,120 +69,121 @@ router.get("/", async (_req, res) => {
       BUSINESS_TIMEZONE,
     );
 
-    const [allOrders, todayOrders, yesterdayOrders, recentOrders] =
-      await Promise.all([
-        Order.find().sort({ createdAt: -1 }),
+    const startOfSalesWindow = startOfDayInTimeZone(
+      new Date(now.getTime() - 6 * DAY_MS),
+      BUSINESS_TIMEZONE,
+    );
+    type WindowRow = {
+      _id: "Pending" | "Delivered" | "Cancelled";
+      orders: number;
+      sales: number;
+      profit: number;
+    };
+    type DailyRow = { _id: string; sales: number };
+    type StatusRow = { _id: "Pending" | "Delivered" | "Cancelled"; value: number };
 
-        Order.find({
-          createdAt: { $gte: startOfToday },
-        }),
-
-        Order.find({
-          createdAt: {
-            $gte: startOfYesterday,
-            $lt: startOfToday,
+    const windowStages = (from: Date, to?: Date) => [
+      {
+        $match: {
+          createdAt: { $gte: from, ...(to ? { $lt: to } : {}) },
+        },
+      },
+      {
+        $group: {
+          _id: "$status",
+          orders: { $sum: 1 },
+          sales: {
+            $sum: {
+              $cond: [{ $ne: ["$status", "Cancelled"] }, "$total", 0],
+            },
           },
-        }),
+          profit: {
+            $sum: {
+              $cond: [{ $ne: ["$status", "Cancelled"] }, "$profit", 0],
+            },
+          },
+        },
+      },
+    ];
 
-        Order.find().sort({ createdAt: -1 }).limit(10),
-      ]);
+    const [
+      todayRows,
+      yesterdayRows,
+      salesRows,
+      statusRows,
+      recentOrders,
+    ] = await Promise.all([
+      Order.aggregate<WindowRow>(windowStages(startOfToday)),
+      Order.aggregate<WindowRow>(
+        windowStages(startOfYesterday, startOfToday),
+      ),
+      Order.aggregate<DailyRow>([
+        { $match: { createdAt: { $gte: startOfSalesWindow }, status: { $ne: "Cancelled" } } },
+        {
+          $group: {
+            _id: {
+              $dateToString: {
+                format: "%Y-%m-%d",
+                date: "$createdAt",
+                timezone: BUSINESS_TIMEZONE,
+              },
+            },
+            sales: { $sum: "$total" },
+          },
+        },
+      ]),
+      Order.aggregate<StatusRow>([
+        { $group: { _id: "$status", value: { $sum: 1 } } },
+      ]),
+      Order.find().sort({ createdAt: -1 }).limit(10),
+    ]);
 
-    const activeTodayOrders = todayOrders.filter(
-      (order) => order.status !== "Cancelled",
-    );
-
-    const activeYesterdayOrders = yesterdayOrders.filter(
-      (order) => order.status !== "Cancelled",
-    );
-
-    const todaySales = activeTodayOrders.reduce(
-      (total, order) => total + order.total,
-      0,
-    );
-
-    const todayProfit = activeTodayOrders.reduce(
-      (total, order) => total + order.profit,
-      0,
-    );
-
-    const yesterdaySales = activeYesterdayOrders.reduce(
-      (total, order) => total + order.total,
-      0,
-    );
-
-    const yesterdayProfit = activeYesterdayOrders.reduce(
-      (total, order) => total + order.profit,
-      0,
-    );
-
-    const todayOrderCount = activeTodayOrders.length;
-    const yesterdayOrderCount = activeYesterdayOrders.length;
-
-    const todayPendingOrders = todayOrders.filter(
-      (order) => order.status === "Pending",
-    ).length;
-
-    const yesterdayPendingOrders = yesterdayOrders.filter(
-      (order) => order.status === "Pending",
-    ).length;
-
+    const summarizeWindow = (rows: WindowRow[]) => {
+      const active = rows.filter((row) => row._id !== "Cancelled");
+      return {
+        sales: active.reduce((sum, row) => sum + row.sales, 0),
+        profit: active.reduce((sum, row) => sum + row.profit, 0),
+        orders: active.reduce((sum, row) => sum + row.orders, 0),
+        pending: rows.find((row) => row._id === "Pending")?.orders ?? 0,
+      };
+    };
+    const today = summarizeWindow(todayRows);
+    const yesterday = summarizeWindow(yesterdayRows);
+    const salesByDate = new Map(salesRows.map((row) => [row._id, row.sales]));
     const salesData = [];
 
-    // 7 Beirut business days ending today (each bucket is a real
-    // midnight-to-midnight window in Asia/Beirut, not in the host timezone).
     for (let i = 0; i < 7; i++) {
       const date = startOfDayInTimeZone(
         new Date(now.getTime() - (6 - i) * DAY_MS),
         BUSINESS_TIMEZONE,
       );
-
-      const nextDate = startOfDayInTimeZone(
-        new Date(now.getTime() - (5 - i) * DAY_MS),
-        BUSINESS_TIMEZONE,
-      );
-
-      const dayOrders = allOrders.filter(
-        (order) =>
-          order.createdAt >= date &&
-          order.createdAt < nextDate &&
-          order.status !== "Cancelled",
-      );
-
-      const sales = dayOrders.reduce((total, order) => total + order.total, 0);
-
       salesData.push({
         date: businessDayLabel(date),
-        sales,
+        sales: salesByDate.get(dayKeyFormatter.format(date)) ?? 0,
       });
     }
 
-    const delivered = allOrders.filter(
-      (order) => order.status === "Delivered",
-    ).length;
-
-    const pending = allOrders.filter(
-      (order) => order.status === "Pending",
-    ).length;
-
-    const cancelled = allOrders.filter(
-      (order) => order.status === "Cancelled",
-    ).length;
-
-    const totalOrders = allOrders.length;
+    const statusCounts = new Map(
+      statusRows.map((row) => [row._id, row.value]),
+    );
+    const delivered = statusCounts.get("Delivered") ?? 0;
+    const pending = statusCounts.get("Pending") ?? 0;
+    const cancelled = statusCounts.get("Cancelled") ?? 0;
+    const totalOrders = delivered + pending + cancelled;
 
     const recentOrdersWithImages = await addProductImages(recentOrders);
 
     return res.status(200).json({
       stats: {
-        todaySales,
-        todayProfit,
-        todayOrders: todayOrderCount,
-        todayPendingOrders,
+        todaySales: today.sales,
+        todayProfit: today.profit,
+        todayOrders: today.orders,
+        todayPendingOrders: today.pending,
 
-        yesterdaySales,
-        yesterdayProfit,
-        yesterdayOrders: yesterdayOrderCount,
-        yesterdayPendingOrders,
+        yesterdaySales: yesterday.sales,
+        yesterdayProfit: yesterday.profit,
+        yesterdayOrders: yesterday.orders,
+        yesterdayPendingOrders: yesterday.pending,
       },
 
       salesData,

@@ -1,4 +1,4 @@
-import mongoose, { Document, Schema } from "mongoose";
+import mongoose, { Schema } from "mongoose";
 
 /**
  * Tiny named counter used for sequential business numbers.
@@ -7,7 +7,7 @@ import mongoose, { Document, Schema } from "mongoose";
  * concurrent order creations can never receive the same number - even inside
  * transactions (the update participates in the session).
  */
-export interface ICounter extends Document {
+export interface ICounter {
   _id: string;
   seq: number;
 }

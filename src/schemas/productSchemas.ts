@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { campaignKeyFor } from "../lib/adAccounts.js";
+import { campaignKeyFor, isIgnoredAccount } from "../lib/adAccounts.js";
 
 /**
  * One advertising campaign linked to a product.
@@ -10,16 +10,27 @@ import { campaignKeyFor } from "../lib/adAccounts.js";
  * per product, while different accounts with identical campaign names stay
  * separate (their keys differ).
  */
-const campaignRefSchema = z
+export const campaignRefSchema = z
   .object({
     store: z.enum(["viora", "trendora"]),
     accountId: z.string().trim().min(1, "Campaign account is required"),
     campaign: z.string().trim().min(1, "Campaign name is required"),
   })
+  .superRefine((ref, context) => {
+    if (isIgnoredAccount(ref.accountId)) {
+      context.addIssue({
+        code: "custom",
+        path: ["accountId"],
+        message: "This advertising account cannot be linked",
+      });
+    }
+  })
   .transform((ref) => ({
     ...ref,
     key: campaignKeyFor(ref.store, ref.accountId, ref.campaign),
   }));
+
+export const campaignLinkSchema = campaignRefSchema;
 
 export const createProductSchema = z
   .object({

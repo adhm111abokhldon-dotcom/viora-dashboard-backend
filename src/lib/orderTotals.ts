@@ -48,9 +48,14 @@ export function startOfWindowForRange(range: 7 | 30): Date {
 }
 
 /** Product totals over Delivered orders created on or after `from`. */
-export async function getProductTotalsFrom(from: Date): Promise<ProductTotals> {
+export async function getProductTotalsFrom(from?: Date): Promise<ProductTotals> {
   const rows = await Order.aggregate([
-    { $match: { status: "Delivered", createdAt: { $gte: from } } },
+    {
+      $match: {
+        status: "Delivered",
+        ...(from ? { createdAt: { $gte: from } } : {}),
+      },
+    },
     ...itemPrologue(),
     groupByProductAndOrder,
     {

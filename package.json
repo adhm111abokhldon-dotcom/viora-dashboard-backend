@@ -7,7 +7,9 @@
     "dev": "nodemon --exec tsx src/server.ts",
     "start": "tsx src/server.ts",
     "typecheck": "tsc --noEmit",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "tsx --test src/lib/*.test.ts",
+    "backfill:orders": "tsx src/scripts/backfillOrderNumbers.ts backfill",
+    "verify:orders": "tsx src/scripts/backfillOrderNumbers.ts verify"
   },
   "keywords": [],
   "author": "",

@@ -141,6 +141,9 @@ export function itemPrologue(match?: PipelineStage.Match["$match"]): PipelineSta
 export const groupByProductAndOrder: PipelineStage.Group = {
   $group: {
     _id: { productId: "$items.productId", orderId: "$_id" },
+    orderNumber: { $first: "$orderNumber" },
+    createdAt: { $first: "$createdAt" },
+    status: { $first: "$status" },
     name: { $first: "$items.name" },
     units: { $sum: "$items.quantity" },
     revenue: { $sum: "$__itemRevenue" },

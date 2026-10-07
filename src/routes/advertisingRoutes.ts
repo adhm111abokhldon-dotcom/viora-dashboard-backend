@@ -38,11 +38,16 @@ import {
   ALL_ACCOUNT_KEYS,
   BUSINESS_ACCOUNT_KEYS,
   accountFilter,
+  campaignKeyFor,
+  excludeIgnoredAccountsFilter,
   isAccountKey,
+  isIgnoredAccount,
+  parseCampaignKey,
   resolveBusinessAccount,
   type BusinessAccountKey,
 } from "../lib/adAccounts.js";
 import Product from "../models/Product.js";
+import { allocateEvenly } from "../lib/campaignAllocation.js";
 
 /** Translates a plain-English verdict key into the app's localised copy.
  *
@@ -117,6 +122,7 @@ async function resolveWindowAccounts(
     messages?: number;
   }>) {
     const key = resolveBusinessAccount(row.store, row.accountId);
+    if (key === null) continue;
     const bucket = buckets.get(key);
     if (bucket) {
       bucket.spend += row.amount;
@@ -142,6 +148,286 @@ const DEFAULT_LIMIT = 10;
 /** Escape user input before it becomes a regex (same as productRoutes.ts). */
 const escapeRegex = (text: string) =>
   text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+router.get("/campaigns", async (req, res) => {
+  const page = Number(req.query.page ?? 1);
+  const limit = Number(req.query.limit ?? DEFAULT_LIMIT);
+  if (
+    !Number.isSafeInteger(page) ||
+    page < 1 ||
+    !Number.isSafeInteger(limit) ||
+    limit < 1 ||
+    limit > MAX_LIMIT ||
+    !Number.isSafeInteger((page - 1) * limit)
+  ) {
+    return badRequest(res, "Invalid pagination parameters");
+  }
+
+  const search = String(req.query.search ?? "").trim();
+
+  try {
+    const match = {
+      source: "windsor",
+      store: { $in: ["viora", "trendora"] },
+      accountId: { $type: "string", $ne: "", $nin: ["1783521163010511"] },
+      campaign: { $type: "string", $ne: "" },
+      ...excludeIgnoredAccountsFilter(),
+    };
+    const rows = await AdvertisingExpense.aggregate<{
+      rows: Array<{
+        _id: { store?: string; accountId?: string; campaign: string };
+        spend: number;
+        messages: number;
+        clicks: number;
+        platform: string;
+        accountName?: string;
+      }>;
+      total: Array<{ count: number }>;
+    }>([
+      { $match: match },
+      {
+        $group: {
+          _id: {
+            store: "$store",
+            accountId: "$accountId",
+            campaign: "$campaign",
+          },
+          spend: { $sum: "$amount" },
+          messages: { $sum: { $ifNull: ["$messages", 0] } },
+          clicks: { $sum: { $ifNull: ["$clicks", 0] } },
+          platform: { $first: "$platform" },
+          accountName: { $first: "$accountName" },
+        },
+      },
+      ...(search
+        ? [
+            {
+              $match: {
+                "_id.campaign": {
+                  $regex: escapeRegex(search),
+                  $options: "i",
+                },
+              },
+            },
+          ]
+        : []),
+      {
+        $facet: {
+          rows: [
+            { $sort: { spend: -1, "_id.store": 1, "_id.accountId": 1, "_id.campaign": 1 } },
+            { $skip: (page - 1) * limit },
+            { $limit: limit },
+          ],
+          total: [{ $count: "count" }],
+        },
+      },
+    ]);
+
+    const result = rows[0] ?? { rows: [], total: [] };
+    const campaignKeys = result.rows.flatMap((row) => {
+      const { store, accountId, campaign } = row._id;
+      if (
+        (store !== "viora" && store !== "trendora") ||
+        !accountId ||
+        isIgnoredAccount(accountId)
+      ) {
+        return [];
+      }
+      return [campaignKeyFor(store, accountId, campaign)];
+    });
+    const linkedCounts =
+      campaignKeys.length > 0
+        ? await Product.aggregate<{ _id: string; count: number }>([
+            { $unwind: "$campaigns" },
+            {
+              $match: {
+                "campaigns.key": { $in: campaignKeys },
+                "campaigns.accountId": { $nin: ["1783521163010511"] },
+              },
+            },
+            { $group: { _id: "$campaigns.key", count: { $sum: 1 } } },
+          ])
+        : [];
+    const countByKey = new Map(linkedCounts.map((row) => [row._id, row.count]));
+    const campaigns = result.rows.flatMap((row) => {
+      const { store, accountId, campaign } = row._id;
+      if (
+        (store !== "viora" && store !== "trendora") ||
+        !accountId ||
+        isIgnoredAccount(accountId)
+      ) {
+        return [];
+      }
+      const key = campaignKeyFor(store, accountId, campaign);
+      return [
+        {
+          key,
+          store,
+          accountId,
+          campaign,
+          accountKey: resolveBusinessAccount(store, accountId),
+          accountName: row.accountName ?? accountId,
+          platform: row.platform,
+          spend: round2(row.spend),
+          messages: row.messages,
+          clicks: row.clicks,
+          costPerMessage: roundedRatio(row.spend, row.messages),
+          linkedProductCount: countByKey.get(key) ?? 0,
+        },
+      ];
+    });
+
+    const totalCampaigns = result.total[0]?.count ?? 0;
+    const totalPages = Math.ceil(totalCampaigns / limit);
+    return res.status(200).json({
+      campaigns,
+      pagination: {
+        currentPage: page,
+        limit,
+        totalCampaigns,
+        totalPages,
+        hasNextPage: page < totalPages,
+        hasPreviousPage: page > 1,
+      },
+    });
+  } catch (error) {
+    console.error("Failed to fetch campaign catalog:", error);
+    return res.status(500).json({ message: "Failed to fetch campaigns" });
+  }
+});
+
+router.get("/campaigns/:key/products", async (req, res) => {
+  const campaignRef = parseCampaignKey(req.params.key);
+  if (!campaignRef || isIgnoredAccount(campaignRef.accountId)) {
+    return res.status(404).json({ message: "Campaign not found" });
+  }
+
+  const page = Number(req.query.page ?? 1);
+  const limit = Number(req.query.limit ?? DEFAULT_LIMIT);
+  if (
+    !Number.isSafeInteger(page) ||
+    page < 1 ||
+    !Number.isSafeInteger(limit) ||
+    limit < 1 ||
+    limit > MAX_LIMIT ||
+    !Number.isSafeInteger((page - 1) * limit)
+  ) {
+    return badRequest(res, "Invalid pagination parameters");
+  }
+
+  const search = String(req.query.search ?? "").trim();
+  const productFilter = search
+    ? {
+        $or: [
+          { name: { $regex: escapeRegex(search), $options: "i" } },
+          { category: { $regex: escapeRegex(search), $options: "i" } },
+        ],
+      }
+    : {};
+  const key = campaignKeyFor(
+    campaignRef.store,
+    campaignRef.accountId,
+    campaignRef.campaign,
+  );
+
+  try {
+    const [spendRows, totalProducts, products, linkedProductRows] = await Promise.all([
+      AdvertisingExpense.aggregate<{
+        spend: number;
+        messages: number;
+        clicks: number;
+        platform: string;
+        accountName?: string;
+      }>([
+        {
+          $match: {
+            source: "windsor",
+            store: campaignRef.store,
+            accountId: campaignRef.accountId,
+            campaign: campaignRef.campaign,
+            ...excludeIgnoredAccountsFilter(),
+          },
+        },
+        {
+          $group: {
+            _id: null,
+            spend: { $sum: "$amount" },
+            messages: { $sum: { $ifNull: ["$messages", 0] } },
+            clicks: { $sum: { $ifNull: ["$clicks", 0] } },
+            platform: { $first: "$platform" },
+            accountName: { $first: "$accountName" },
+          },
+        },
+      ]),
+      Product.countDocuments(productFilter),
+      Product.find(productFilter)
+        .select("name category imageUrl price cost stock campaigns.key")
+        .sort({ name: 1, _id: 1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean(),
+      Product.find({ "campaigns.key": key })
+        .select("_id")
+        .sort({ _id: 1 })
+        .lean(),
+    ]);
+
+    const spend = spendRows[0];
+    if (!spend && linkedProductRows.length === 0) {
+      return res.status(404).json({ message: "Campaign not found" });
+    }
+    const linkedProductIds = linkedProductRows.map((product) =>
+      product._id.toString(),
+    );
+    const allocations = allocateEvenly(
+      spend?.spend ?? 0,
+      linkedProductIds.length,
+    );
+    const allocationByProductId = new Map(
+      linkedProductIds.map((id, index) => [id, allocations[index] ?? 0]),
+    );
+    const totalPages = Math.ceil(totalProducts / limit);
+    return res.status(200).json({
+      campaign: {
+        key,
+        ...campaignRef,
+        accountKey: resolveBusinessAccount(
+          campaignRef.store,
+          campaignRef.accountId,
+        ),
+        accountName: spend?.accountName ?? campaignRef.accountId,
+        platform: spend?.platform ?? "Meta",
+        spend: round2(spend?.spend ?? 0),
+        messages: spend?.messages ?? 0,
+        clicks: spend?.clicks ?? 0,
+        costPerMessage: roundedRatio(spend?.spend ?? 0, spend?.messages ?? 0),
+        linkedProductCount: linkedProductIds.length,
+      },
+      products: products.map((product) => ({
+        _id: product._id.toString(),
+        name: product.name,
+        category: product.category,
+        imageUrl: product.imageUrl ?? null,
+        price: product.price,
+        cost: product.cost,
+        stock: product.stock,
+        linked: (product.campaigns ?? []).some((ref) => ref.key === key),
+        allocation: allocationByProductId.get(product._id.toString()) ?? null,
+      })),
+      pagination: {
+        currentPage: page,
+        limit,
+        totalProducts,
+        totalPages,
+        hasNextPage: page < totalPages,
+        hasPreviousPage: page > 1,
+      },
+    });
+  } catch (error) {
+    console.error("Failed to fetch campaign detail:", error);
+    return res.status(500).json({ message: "Failed to fetch campaign detail" });
+  }
+});
 
 function badRequest(res: import("express").Response, message: string, issues?: unknown) {
   return res.status(400).json({ message, errors: issues });
@@ -197,6 +483,7 @@ router.get("/", async (req, res) => {
       typeof req.query.search === "string" ? req.query.search.trim() : "";
 
     const filter: QueryFilter<IAdvertisingExpense> = {};
+    Object.assign(filter, excludeIgnoredAccountsFilter());
 
     const range = parseRange(req.query as Record<string, unknown>);
     if (range) filter.date = range;
@@ -482,9 +769,16 @@ async function manualSpendTotal() {
 
 /** Build the per-source rows the UI and the sync both need. */
 function summarise(result: Awaited<ReturnType<typeof fetchAllWindsorData>>) {
+  const validRows = result.connections
+    .flatMap((conn) => conn.rows)
+    .filter((row) => !isIgnoredAccount(row.accountId));
+  const availableDates = validRows.map((row) => row.date).sort();
+
   // Accounts with usable rows.
   const sources = result.connections.flatMap((conn) =>
-    conn.accounts.map((acc) => ({
+    conn.accounts
+      .filter((acc) => !isIgnoredAccount(acc.accountId))
+      .map((acc) => ({
       store: acc.store,
       connectionId: conn.connectionId,
       connectionLabel: conn.label,
@@ -504,7 +798,7 @@ function summarise(result: Awaited<ReturnType<typeof fetchAllWindsorData>>) {
       messages: acc.messages,
       clicks: acc.clicks,
       costPerMessage: ratio(aedToUsd(acc.sourceSpend), acc.messages),
-    })),
+      })),
   );
 
   /*
@@ -516,6 +810,7 @@ function summarise(result: Awaited<ReturnType<typeof fetchAllWindsorData>>) {
     conn.sightings
       .filter(
         (sighting) =>
+          !isIgnoredAccount(sighting.accountId) &&
           !conn.accounts.some(
             (acc) => (acc.accountId || "unknown") === (sighting.accountId || "unknown"),
           ),
@@ -543,14 +838,16 @@ function summarise(result: Awaited<ReturnType<typeof fetchAllWindsorData>>) {
   return {
     rate: AED_PER_USD_LABEL,
     currency: WINDSOR_SOURCE_CURRENCY,
-    availableFrom: result.availableFrom,
-    availableTo: result.availableTo,
+    availableFrom: availableDates[0] ?? null,
+    availableTo: availableDates.at(-1) ?? null,
     connections: result.connections.map((conn) => ({
       id: conn.connectionId,
       store: conn.store,
       label: conn.label,
-      rowCount: conn.rows.length,
-      accountCount: conn.accounts.length,
+      rowCount: conn.rows.filter((row) => !isIgnoredAccount(row.accountId)).length,
+      accountCount: conn.accounts.filter(
+        (account) => !isIgnoredAccount(account.accountId),
+      ).length,
     })),
     errors: result.errors,
     sources: [...sources, ...emptySources],
@@ -579,7 +876,9 @@ router.post("/windsor/preview", async (_req, res) => {
       });
     }
 
-    const rows = result.connections.flatMap((c) => c.rows);
+    const rows = result.connections
+      .flatMap((c) => c.rows)
+      .filter((row) => !isIgnoredAccount(row.accountId));
 
     // BOTH key formats: rows synced before the store segment existed still
     // live under the legacy key until the sync re-keys them, so preview must
@@ -666,7 +965,9 @@ router.post("/windsor/preview", async (_req, res) => {
 router.post("/windsor/sync", async (_req, res) => {
   try {
     const result = await fetchAllWindsorData();
-    const rows = result.connections.flatMap((c) => c.rows);
+    const rows = result.connections
+      .flatMap((c) => c.rows)
+      .filter((row) => !isIgnoredAccount(row.accountId));
 
     if (rows.length === 0) {
       return res.status(200).json({
@@ -877,7 +1178,7 @@ router.get("/insights", async (_req, res) => {
       // Per ad account, ALL time. Pinned sort: $group output order is
       // unspecified, and refetches must be byte-identical.
       AdvertisingExpense.aggregate([
-        { $match: { source: "windsor" } },
+        { $match: { source: "windsor", ...excludeIgnoredAccountsFilter() } },
         {
           $group: {
             _id: { store: "$store", accountId: "$accountId" },
@@ -891,7 +1192,7 @@ router.get("/insights", async (_req, res) => {
 
       // Per campaign, ALL time.
       AdvertisingExpense.aggregate([
-        { $match: { source: "windsor" } },
+        { $match: { source: "windsor", ...excludeIgnoredAccountsFilter() } },
         {
           $group: {
             _id: {
@@ -920,6 +1221,9 @@ router.get("/insights", async (_req, res) => {
       messages: number;
       clicks: number;
       campaigns: Array<{
+        key: string;
+        store: "viora" | "trendora";
+        accountId: string;
         campaign: string;
         spend: number;
         messages: number;
@@ -946,11 +1250,12 @@ router.get("/insights", async (_req, res) => {
       ),
     );
 
-    const bucketFor = (store: unknown, accountId: unknown): Bucket => {
+    const bucketFor = (store: unknown, accountId: unknown): Bucket | null => {
       const key = resolveBusinessAccount(
         typeof store === "string" ? store : null,
         typeof accountId === "string" ? accountId : null,
       );
+      if (key === null) return null;
 
       let bucket = buckets.get(key);
       if (!bucket) {
@@ -970,7 +1275,7 @@ router.get("/insights", async (_req, res) => {
 
     type CampaignAggRow = {
       _id: {
-        store: string | null;
+        store: "viora" | "trendora" | null;
         accountId: string | null;
         campaign: string | null;
       };
@@ -981,6 +1286,7 @@ router.get("/insights", async (_req, res) => {
 
     for (const row of accountAgg as AccountAggRow[]) {
       const bucket = bucketFor(row._id.store, row._id.accountId);
+      if (!bucket) continue;
 
       bucket.spend += row.spend;
       bucket.messages += row.messages ?? 0;
@@ -988,8 +1294,16 @@ router.get("/insights", async (_req, res) => {
     }
 
     for (const row of campaignAgg as CampaignAggRow[]) {
-      bucketFor(row._id.store, row._id.accountId).campaigns.push({
-        campaign: typeof row._id.campaign === "string" ? row._id.campaign : "",
+      const { store, accountId, campaign } = row._id;
+      if (!store || !accountId || !campaign) continue;
+      const bucket = bucketFor(row._id.store, row._id.accountId);
+      if (!bucket) continue;
+
+      bucket.campaigns.push({
+        key: campaignKeyFor(store, accountId, campaign),
+        store,
+        accountId,
+        campaign,
         spend: round2(row.spend),
         messages: row.messages ?? 0,
         clicks: row.clicks ?? 0,
@@ -1044,178 +1358,11 @@ router.get("/insights", async (_req, res) => {
   }
 });
 
-/* -------------------------------------------------------------------------- */
-/* GET /api/advertising/:id/products - products linked to this campaign       */
-/* -------------------------------------------------------------------------- */
-
-router.get("/:id/products", async (req, res) => {
-  if (!mongoose.isValidObjectId(req.params.id)) {
-    return res.status(400).json({ message: "Invalid campaign ID" });
-  }
-
-  const campaignId = new mongoose.Types.ObjectId(req.params.id);
-
-  try {
-    const campaign = await AdvertisingExpense.findById(campaignId).lean();
-
-    if (!campaign) {
-      return res.status(404).json({ message: "Campaign not found" });
-    }
-
-    /*
-      Ad campaigns are IMPLICIT because there is no campaign collection:
-      a campaign is (store, accountId, campaignName) rows in
-      advertisingexpenses. A campaign collection would need to be frozen in
-      time to be safe (rename/merge = audit disaster), so everything reads
-      from advertisingexpenses - the same source the historical report uses
-      and the same place owners update.
-    */
-    const key = campaignKeyFor(
-      campaign.store,
-      campaign.accountId ?? "",
-      campaign.campaign ?? "",
-    );
-
-    const products = await Product.find({
-      "campaigns.key": key,
-    })
-      .select("name category imageUrl price stock")
-      .lean();
-
-    const productsWithLinks = products.map((product) => {
-      const ref = (product.campaigns ?? []).find(
-        (c) => c.key === key,
-      );
-
-      return {
-        product: {
-          _id: product._id.toString(),
-          name: product.name,
-          category: product.category,
-          imageUrl: product.imageUrl ?? null,
-          price: product.price,
-          cost: product.cost,
-          stock: product.stock,
-        },
-        linkedAt: campaign.createdAt,
-        link: ref
-          ? { key: ref.key, store: ref.store, accountId: ref.accountId, campaign: ref.campaign }
-          : null,
-      };
-    });
-
-    return res.status(200).json({
-      campaign: {
-        _id: campaign._id.toString(),
-        store: campaign.store,
-        accountId: campaign.accountId,
-        campaign: campaign.campaign,
-        accountName: campaign.accountName,
-        platform: campaign.platform,
-        createdAt: campaign.createdAt,
-        updatedAt: campaign.updatedAt,
-      },
-      products: productsWithLinks,
-    });
-  } catch (error) {
-    console.error("Failed to fetch campaign products:", error);
-
-    return res.status(500).json({
-      message: "Failed to fetch campaign products",
-    });
-  }
-});
-
-/* -------------------------------------------------------------------------- */
-/* GET /api/advertising/:id/products - products linked to this campaign       */
-/* -------------------------------------------------------------------------- */
-
-router.get("/:id/products", async (req, res) => {
-  if (!mongoose.isValidObjectId(req.params.id)) {
-    return res.status(400).json({ message: "Invalid campaign ID" });
-  }
-
-  const campaignId = new mongoose.Types.ObjectId(req.params.id);
-
-  try {
-    const campaign = await AdvertisingExpense.findById(campaignId).lean();
-
-    if (!campaign) {
-      return res.status(404).json({ message: "Campaign not found" });
-    }
-
-    /*
-      Ad campaigns are IMPLICIT because there is no campaign collection:
-      a campaign is (store, accountId, campaignName) rows in
-      advertisingexpenses. A campaign collection would need to be frozen in
-      time to be safe (rename/merge = audit disaster), so everything reads
-      from advertisingexpenses - the same source the historical report uses
-      and the same place owners update.
-    */
-    const key = campaignKeyFor(
-      campaign.store,
-      campaign.accountId ?? "",
-      campaign.campaign ?? "",
-    );
-
-    const products = await Product.find({
-      "campaigns.key": key,
-    })
-      .select("name category imageUrl price stock")
-      .lean();
-
-    const productsWithLinks = products.map((product) => {
-      const ref = (product.campaigns ?? []).find(
-        (c) => c.key === key,
-      );
-
-      return {
-        product: {
-          _id: product._id.toString(),
-          name: product.name,
-          category: product.category,
-          imageUrl: product.imageUrl ?? null,
-          price: product.price,
-          cost: product.cost,
-          stock: product.stock,
-        },
-        linkedAt: campaign.createdAt,
-        link: ref
-          ? { key: ref.key, store: ref.store, accountId: ref.accountId, campaign: ref.campaign }
-          : null,
-      };
-    });
-
-    return res.status(200).json({
-      campaign: {
-        _id: campaign._id.toString(),
-        store: campaign.store,
-        accountId: campaign.accountId,
-        campaign: campaign.campaign,
-        accountName: campaign.accountName,
-        platform: campaign.platform,
-        createdAt: campaign.createdAt,
-        updatedAt: campaign.updatedAt,
-      },
-      products: productsWithLinks,
-    });
-  } catch (error) {
-    console.error("Failed to fetch campaign products:", error);
-
-    return res.status(500).json({
-      message: "Failed to fetch campaign products",
-    });
-  }
-});
-
-
 /**
  * POST /api/advertising/performance
  *
- * Period-scoped ad analytics behind the Advertising page's funnel and
- * performance verdicts. `range` is `7` or `30` and selects the Beirut
- * business window (same helper as the reports endpoint), so the verdicts
- * always answer "for the last N days".
+ * Ad analytics behind the Advertising page. The default is all available
+ * history; an explicit `7` or `30` range selects the Beirut business window.
  *
  *   - delivered orders / product profit come from Delivered orders only;
  *   - ad spend and messages come from every stored advertising row in the
@@ -1225,46 +1372,46 @@ router.get("/:id/products", async (req, res) => {
  */
 router.post("/performance", async (req, res) => {
   try {
-    const range = Number(req.query.range);
-    const parsedRange = range === 7 || range === 30 ? range : 7;
+    const parsedRange: "all" | 7 | 30 =
+      req.query.range === "7" ? 7 : req.query.range === "30" ? 30 : "all";
 
     // Beirut midnight "today", expressed as a real UTC instant.
     const startOfToday = startOfDayInTimeZone(new Date(), TIMEZONE);
 
-    // First day of the window (range - 1 days ago, inclusive).
-    const startOfWindow = startOfWindowForRange(parsedRange);
+    const startOfWindow =
+      parsedRange === "all" ? undefined : startOfWindowForRange(parsedRange);
 
     /* ------------------------------------------------------------------ */
     /* Delivered orders in the window (product sales + profit).           */
     /* ------------------------------------------------------------------ */
-    const orderAgg = await Order.aggregate([
-      {
-        $match: {
-          status: "Delivered",
-          createdAt: { $gte: startOfWindow },
+    const [orderCountRows, productTotals] = await Promise.all([
+      Order.aggregate<{ count: number }>([
+        {
+          $match: {
+            status: "Delivered",
+            ...(startOfWindow ? { createdAt: { $gte: startOfWindow } } : {}),
+          },
         },
-      },
-      {
-        $group: {
-          _id: null,
-          deliveredOrders: { $sum: 1 },
-          productSales: { $sum: "$total" },
-          productProfit: { $sum: "$profit" },
-        },
-      },
+        { $count: "count" },
+      ]),
+      getProductTotalsFrom(startOfWindow),
     ]);
-
-    const orders = orderAgg[0] ?? {
-      deliveredOrders: 0,
-      productSales: 0,
-      productProfit: 0,
+    const orders = {
+      deliveredOrders: orderCountRows[0]?.count ?? 0,
+      productSales: productTotals.productSales,
+      productProfit: productTotals.productProfit,
     };
 
     /* ------------------------------------------------------------------ */
     /* Advertising rows in the window (manual + Windsor, exactly once).   */
     /* ------------------------------------------------------------------ */
     const advertisingAgg = await AdvertisingExpense.aggregate([
-      { $match: { date: { $gte: startOfWindow } } },
+      {
+        $match: {
+          ...(startOfWindow ? { date: { $gte: startOfWindow } } : {}),
+          ...excludeIgnoredAccountsFilter(),
+        },
+      },
       {
         $group: {
           _id: null,
@@ -1277,7 +1424,12 @@ router.post("/performance", async (req, res) => {
     const ads = advertisingAgg[0] ?? { spend: 0, messages: 0 };
 
     const accountAgg = await AdvertisingExpense.aggregate([
-      { $match: { date: { $gte: startOfWindow } } },
+      {
+        $match: {
+          ...(startOfWindow ? { date: { $gte: startOfWindow } } : {}),
+          ...excludeIgnoredAccountsFilter(),
+        },
+      },
       {
         $group: {
           _id: { store: "$store", accountId: "$accountId" },
@@ -1298,6 +1450,7 @@ router.post("/performance", async (req, res) => {
       messages: number;
     }>) {
       const key = resolveBusinessAccount(row._id.store, row._id.accountId);
+      if (key === null) continue;
       const bucket = buckets.get(key);
       if (bucket) {
         bucket.spend += row.spend;
@@ -1319,7 +1472,8 @@ router.post("/performance", async (req, res) => {
     const dailyAdMessages = new Map<string, number>();
 
     const dailyRows = await AdvertisingExpense.find({
-      date: { $gte: startOfWindow },
+      ...(startOfWindow ? { date: { $gte: startOfWindow } } : {}),
+      ...excludeIgnoredAccountsFilter(),
     }).lean();
 
     for (const row of dailyRows as Array<{
@@ -1391,7 +1545,8 @@ router.post("/performance", async (req, res) => {
         adSpend: round2(ads.spend),
         adMessages: ads.messages,
         adCount: await AdvertisingExpense.countDocuments({
-          date: { $gte: startOfWindow },
+          ...(startOfWindow ? { date: { $gte: startOfWindow } } : {}),
+          ...excludeIgnoredAccountsFilter(),
         }),
       },
       financials: {
