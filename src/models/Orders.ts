@@ -17,7 +17,7 @@ export interface IOrder extends Document {
    * _id, index, sorting or pagination, and never renumbered.
    * May be missing only on documents predating the backfill migration.
    */
-  orderNumber?: number;
+  orderNumber: number;
   customer: string;
   phone: string;
   items: IOrderItem[];
@@ -45,7 +45,7 @@ const orderSchema = new Schema<IOrder>(
   {
     // Sparse: pre-backfill documents simply have no number yet, and the
     // unique index only compares the documents that DO have one.
-    orderNumber: { type: Number, unique: true, sparse: true },
+    orderNumber: { type: Number, required: true, unique: true, sparse: true },
 
     customer: { type: String, required: true, trim: true },
     phone: { type: String, required: true, trim: true },

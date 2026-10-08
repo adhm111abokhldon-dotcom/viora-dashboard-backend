@@ -16,7 +16,7 @@ import {
   startOfWindowForRange,
 } from "../lib/orderTotals.js";
 import { round2 } from "../lib/money.js";
-import { excludeIgnoredAccountsFilter } from "../lib/adAccounts.js";
+import { excludeUnmappedWindsorAccountsFilter } from "../lib/adAccounts.js";
 
 const router = Router();
 
@@ -151,7 +151,7 @@ router.get("/", async (req, res) => {
           {
             $match: {
               ...(startOfWindow ? { date: { $gte: startOfWindow } } : {}),
-              ...excludeIgnoredAccountsFilter(),
+              ...excludeUnmappedWindsorAccountsFilter(),
             },
           },
           { $group: { _id: null, total: { $sum: "$amount" }, count: { $sum: 1 } } },

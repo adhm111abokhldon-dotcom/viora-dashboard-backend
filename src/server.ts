@@ -8,12 +8,10 @@ import reportRoutes from "./routes/reportRoutes.js";
 import dashboardRoutes from "./routes/dashboardRoutes.js";
 import advertisingRoutes from "./routes/advertisingRoutes.js";
 import productStatsRoutes from "./routes/productStatsRoutes.js";
-import authRoutes from "./routes/authRoutes.js";
 import {
-  assertAuthConfiguration,
-  requireAuthentication,
-} from "./lib/auth.js";
-import { ensureOrderNumberCounter } from "./lib/orderNumber.js";
+  assertBusinessNumbersComplete,
+  ensureBusinessNumberCounters,
+} from "./lib/orderNumber.js";
 
 dotenv.config();
 
@@ -40,7 +38,6 @@ const allowedOrigins = new Set(frontendOrigins);
 
 app.use(
   cors({
-    credentials: true,
     origin(origin, callback) {
       callback(null, origin === undefined || allowedOrigins.has(origin));
     },
@@ -64,7 +61,11 @@ app.use("/api", (req, res, next) => {
   const origin = req.get("origin");
   const isMutation = !["GET", "HEAD", "OPTIONS"].includes(req.method);
 
-  if (isMutation && origin && !allowedOrigins.has(origin)) {
+  const isProduction = process.env.NODE_ENV === "production";
+  if (
+    isMutation &&
+    ((!origin && isProduction) || (origin && !allowedOrigins.has(origin)))
+  ) {
     res.status(403).json({ message: "Request origin is not allowed" });
     return;
   }
@@ -72,8 +73,6 @@ app.use("/api", (req, res, next) => {
   next();
 });
 
-app.use("/api/auth", authRoutes);
-app.use("/api", requireAuthentication);
 app.use("/api/products", productRoutes);
 // "/api/products/:id/stats" has two segments, so productRoutes' single-segment
 // "/:id" handler cannot swallow it; Express simply falls through.
@@ -107,9 +106,9 @@ app.use(
 );
 
 async function startServer() {
-  assertAuthConfiguration();
   await connectDB();
-  await ensureOrderNumberCounter();
+  await assertBusinessNumbersComplete();
+  await ensureBusinessNumberCounters();
 
   const server = app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);

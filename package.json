@@ -8,8 +8,8 @@
     "start": "tsx src/server.ts",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test src/lib/*.test.ts",
-    "backfill:orders": "tsx src/scripts/backfillOrderNumbers.ts backfill",
-    "verify:orders": "tsx src/scripts/backfillOrderNumbers.ts verify"
+    "migrate:business-numbers": "tsx src/scripts/migrateBusinessNumbers.ts",
+    "migrate:windsor-keys": "tsx src/scripts/migrateWindsorKeys.ts"
   },
   "keywords": [],
   "author": "",

@@ -1,5 +1,21 @@
 import mongoose, { Document, Schema } from "mongoose";
 
+export interface IAdvertisingExpenseAllocationProduct {
+  productId: string;
+  productName: string;
+  amount: number;
+  shareIndex: number;
+  shareCount: number;
+}
+
+export interface IAdvertisingExpenseAllocationSnapshot {
+  campaignSpend: number;
+  allocatedSpend: number;
+  unallocatedSpend: number;
+  capturedAt: Date;
+  products: IAdvertisingExpenseAllocationProduct[];
+}
+
 /**
  * Manual advertising expenses.
  *
@@ -60,9 +76,45 @@ export interface IAdvertisingExpense extends Document {
   /** Windsor account status, e.g. ACTIVE / DISABLED. */
   accountStatus?: string;
 
+  /** Latest campaign effective status reported by Windsor. */
+  campaignEffectiveStatus?: string;
+
+  /** Campaign's configured status when Windsor provides it. */
+  campaignConfiguredStatus?: string;
+
+  /** Last successful full sync in which this campaign-day row was returned. */
+  lastSeenAt?: Date;
+
+  /** Immutable product mapping for this campaign-day spend record. */
+  allocationSnapshot?: IAdvertisingExpenseAllocationSnapshot;
+
   createdAt: Date;
   updatedAt: Date;
 }
+
+const allocationProductSchema =
+  new Schema<IAdvertisingExpenseAllocationProduct>(
+    {
+      productId: { type: String, required: true },
+      productName: { type: String, required: true },
+      amount: { type: Number, required: true, min: 0 },
+      shareIndex: { type: Number, required: true, min: 0 },
+      shareCount: { type: Number, required: true, min: 1 },
+    },
+    { _id: false },
+  );
+
+const allocationSnapshotSchema =
+  new Schema<IAdvertisingExpenseAllocationSnapshot>(
+    {
+      campaignSpend: { type: Number, required: true, min: 0 },
+      allocatedSpend: { type: Number, required: true, min: 0 },
+      unallocatedSpend: { type: Number, required: true, min: 0 },
+      capturedAt: { type: Date, required: true },
+      products: { type: [allocationProductSchema], default: [] },
+    },
+    { _id: false },
+  );
 
 const advertisingExpenseSchema = new Schema<IAdvertisingExpense>(
   {
@@ -84,6 +136,10 @@ const advertisingExpenseSchema = new Schema<IAdvertisingExpense>(
     accountId: { type: String, trim: true },
     accountName: { type: String, trim: true },
     accountStatus: { type: String, trim: true },
+    campaignEffectiveStatus: { type: String, trim: true },
+    campaignConfiguredStatus: { type: String, trim: true },
+    lastSeenAt: { type: Date },
+    allocationSnapshot: { type: allocationSnapshotSchema },
   },
   { timestamps: true },
 );
@@ -92,17 +148,25 @@ const advertisingExpenseSchema = new Schema<IAdvertisingExpense>(
  * Indexes supporting the queries the API actually runs:
  *  - default listing sorted by date descending
  *  - date-range filtering (financial summary for a 7/30 day window)
- *  - Windsor upsert by externalKey (idempotent sync)
+ *  - unique Windsor upserts by source + externalKey (idempotent sync)
  *  - insights split by source
  *
- * `externalKey` is deliberately NOT a unique index: existing documents have no
- * externalKey, and building a unique index over a collection that has not been
- * fully backfilled would risk a startup error. Idempotency is instead enforced
- * by upserting on externalKey in the sync route, which is sufficient here.
+ * The partial unique index applies only to Windsor rows with a string key.
+ * Run the deduplication migration before creating it on an existing database.
  */
 advertisingExpenseSchema.index({ date: -1 });
 advertisingExpenseSchema.index({ platform: 1, date: -1 });
-advertisingExpenseSchema.index({ externalKey: 1 });
+advertisingExpenseSchema.index(
+  { source: 1, externalKey: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      source: "windsor",
+      externalKey: { $type: "string" },
+    },
+    name: "windsor_external_key_unique",
+  },
+);
 advertisingExpenseSchema.index({ source: 1, date: -1 });
 // Per-store / per-ad-account breakdowns on the advertising page.
 advertisingExpenseSchema.index({ source: 1, store: 1, accountId: 1 });

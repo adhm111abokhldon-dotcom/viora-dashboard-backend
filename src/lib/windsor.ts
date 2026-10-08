@@ -59,6 +59,8 @@ export const WINDSOR_FIELDS = {
   // Requesting account_status makes Windsor ALSO return accounts that are
   // disabled / have no activity, so a second ad account is never invisible.
   accountStatus: "account_status",
+  campaignEffectiveStatus: "campaign_effective_status",
+  campaignConfiguredStatus: "campaign_configured_status",
 } as const;
 
 const REQUESTED_FIELDS = Object.values(WINDSOR_FIELDS).join(",");
@@ -132,6 +134,8 @@ export type WindsorRow = {
   accountId: string;
   accountName: string;
   accountStatus: string;
+  campaignEffectiveStatus: string | null;
+  campaignConfiguredStatus: string | null;
   /** YYYY-MM-DD exactly as Windsor returned it. */
   date: string;
   campaign: string;
@@ -186,6 +190,69 @@ export type WindsorFetchAllResult = {
   /** Connections that failed, so one broken account cannot hide the other. */
   errors: Array<{ connectionId: WindsorConnectionId; message: string }>;
 };
+
+/**
+ * Windsor may return an empty campaign-day row alongside its populated row.
+ * Collapse those rows before previewing or syncing, and reject conflicting
+ * populated rows rather than allowing response order to overwrite metrics.
+ */
+export function deduplicateCampaignDayRows(rows: WindsorRow[]): WindsorRow[] {
+  const groups = new Map<string, WindsorRow[]>();
+
+  for (const row of rows) {
+    const key = JSON.stringify([
+      row.store,
+      row.connectionId,
+      row.accountId,
+      row.date,
+      row.campaign,
+    ]);
+    const group = groups.get(key) ?? [];
+    group.push(row);
+    groups.set(key, group);
+  }
+
+  const deduplicated: WindsorRow[] = [];
+
+  for (const group of groups.values()) {
+    if (group.length === 1) {
+      deduplicated.push(group[0]!);
+      continue;
+    }
+
+    const populated = group.filter(
+      (row) => row.spend !== 0 || row.clicks !== 0 || row.messages !== 0,
+    );
+    const candidates = populated.length > 0 ? populated : group;
+    const signatures = new Set(
+      candidates.map((row) =>
+        JSON.stringify([
+          row.accountName,
+          row.accountStatus,
+          row.campaignEffectiveStatus,
+          row.campaignConfiguredStatus,
+          row.spend,
+          row.clicks,
+          row.messages,
+          row.costPerMessage,
+          row.currency,
+        ]),
+      ),
+    );
+
+    if (signatures.size > 1) {
+      throw new WindsorError(
+        "Windsor returned conflicting rows for the same campaign and day",
+        502,
+        group[0]!.connectionId,
+      );
+    }
+
+    deduplicated.push(candidates[0]!);
+  }
+
+  return deduplicated;
+}
 
 /** Marker for rows with no account id, so keys stay well-formed. */
 export const UNKNOWN_ACCOUNT = "unknown";
@@ -320,6 +387,14 @@ function normalise(
         typeof r[WINDSOR_FIELDS.accountStatus] === "string"
           ? (r[WINDSOR_FIELDS.accountStatus] as string).trim()
           : "",
+      campaignEffectiveStatus:
+        typeof r[WINDSOR_FIELDS.campaignEffectiveStatus] === "string"
+          ? (r[WINDSOR_FIELDS.campaignEffectiveStatus] as string).trim()
+          : null,
+      campaignConfiguredStatus:
+        typeof r[WINDSOR_FIELDS.campaignConfiguredStatus] === "string"
+          ? (r[WINDSOR_FIELDS.campaignConfiguredStatus] as string).trim()
+          : null,
       date,
       campaign,
       spend: num(r[WINDSOR_FIELDS.spend]),
@@ -331,7 +406,11 @@ function normalise(
     });
   }
 
-  return { rows, currency, sightings: [...seen.values()] };
+  return {
+    rows: deduplicateCampaignDayRows(rows),
+    currency,
+    sightings: [...seen.values()],
+  };
 }
 
 /** Group a connection's rows per ad account, keeping them fully separate. */

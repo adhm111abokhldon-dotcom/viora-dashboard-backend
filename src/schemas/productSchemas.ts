@@ -1,5 +1,8 @@
 import { z } from "zod";
-import { campaignKeyFor, isIgnoredAccount } from "../lib/adAccounts.js";
+import {
+  campaignKeyFor,
+  isKnownBusinessAccount,
+} from "../lib/adAccounts.js";
 
 /**
  * One advertising campaign linked to a product.
@@ -17,11 +20,11 @@ export const campaignRefSchema = z
     campaign: z.string().trim().min(1, "Campaign name is required"),
   })
   .superRefine((ref, context) => {
-    if (isIgnoredAccount(ref.accountId)) {
+    if (!isKnownBusinessAccount(ref.store, ref.accountId)) {
       context.addIssue({
         code: "custom",
         path: ["accountId"],
-        message: "This advertising account cannot be linked",
+        message: "This advertising account is not mapped",
       });
     }
   })

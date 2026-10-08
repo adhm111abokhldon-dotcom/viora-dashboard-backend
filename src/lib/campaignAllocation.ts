@@ -57,3 +57,74 @@ export function allocatedShareAt(
 
   return allocateEvenly(total, count)[index] ?? 0;
 }
+
+export type AllocationProduct = {
+  productId: string;
+  productName: string;
+  amount: number;
+  shareIndex: number;
+  shareCount: number;
+};
+
+export type CampaignAllocationSnapshot = {
+  campaignSpend: number;
+  allocatedSpend: number;
+  unallocatedSpend: number;
+  capturedAt: Date;
+  products: AllocationProduct[];
+};
+
+export function createCampaignAllocationSnapshot(
+  campaignSpend: number,
+  products: Array<{ productId: string; productName: string }>,
+  capturedAt = new Date(),
+): CampaignAllocationSnapshot {
+  const ordered = [...products].sort((left, right) =>
+    left.productId.localeCompare(right.productId),
+  );
+  const amounts = allocateEvenly(campaignSpend, ordered.length);
+  const allocatedSpend = round2(
+    amounts.reduce((sum, amount) => sum + amount, 0),
+  );
+
+  return {
+    campaignSpend: round2(campaignSpend),
+    allocatedSpend,
+    unallocatedSpend:
+      ordered.length === 0 ? round2(campaignSpend) : 0,
+    capturedAt,
+    products: ordered.map((product, index) => ({
+      ...product,
+      amount: amounts[index] ?? 0,
+      shareIndex: index,
+      shareCount: ordered.length,
+    })),
+  };
+}
+
+/** Revalue provider-corrected spend without changing the captured product set. */
+export function revalueCampaignAllocationSnapshot(
+  campaignSpend: number,
+  snapshot: CampaignAllocationSnapshot,
+): CampaignAllocationSnapshot {
+  const amounts = allocateEvenly(campaignSpend, snapshot.products.length);
+  const products = snapshot.products.map((product, index) => ({
+    productId: product.productId,
+    productName: product.productName,
+    amount: amounts[index] ?? 0,
+    shareIndex: index,
+    shareCount: snapshot.products.length,
+  }));
+  const allocatedSpend = round2(
+    products.reduce((sum, product) => sum + product.amount, 0),
+  );
+
+  return {
+    campaignSpend: round2(campaignSpend),
+    allocatedSpend,
+    unallocatedSpend:
+      products.length === 0 ? round2(campaignSpend) : 0,
+    capturedAt: snapshot.capturedAt,
+    products,
+  };
+}

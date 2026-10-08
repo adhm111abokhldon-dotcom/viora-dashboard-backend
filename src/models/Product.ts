@@ -16,6 +16,7 @@ export interface ICampaignRef {
 }
 
 export interface IProduct extends Document {
+  productNumber: number;
   name: string;
   category: string;
   price: number;
@@ -46,6 +47,12 @@ const campaignRefSchema = new Schema<ICampaignRef>(
 
 const productSchema = new Schema<IProduct>(
   {
+    productNumber: {
+      type: Number,
+      required: true,
+      unique: true,
+      sparse: true,
+    },
     name: {
       type: String,
       required: true,
@@ -100,4 +107,3 @@ productSchema.index({ "campaigns.key": 1 });
 const Product = mongoose.model<IProduct>("Product", productSchema);
 
 export default Product;
-

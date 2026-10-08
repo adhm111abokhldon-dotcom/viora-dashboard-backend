@@ -12,6 +12,8 @@ export interface ICounter {
   seq: number;
 }
 
+export type CounterName = "orderNumber" | "productNumber";
+
 const counterSchema = new Schema<ICounter>({
   // The counter NAME ("orderNumber"), not an ObjectId.
   _id: { type: String, required: true },

@@ -1,5 +1,6 @@
 import { Router } from "express";
 import Product from "../models/Product.js";
+import type { IProduct } from "../models/Product.js";
 import Order from "../models/Orders.js";
 import AdvertisingExpense from "../models/AdvertisingExpense.js";
 import mongoose from "mongoose";
@@ -17,15 +18,17 @@ import {
   itemPrologue,
   groupByProductAndOrder,
 } from "../lib/productStats.js";
+import { captureMissingCampaignAllocations } from "../lib/advertisingAllocationSnapshots.js";
 import {
   campaignKeyFor,
-  isIgnoredAccount,
+  isKnownBusinessAccount,
+  excludeUnmappedWindsorAccountsFilter,
   resolveBusinessAccount,
   type StoreId,
 } from "../lib/adAccounts.js";
-import { allocateEvenly } from "../lib/campaignAllocation.js";
 import { round2 } from "../lib/money.js";
 import { calculateProductProfit } from "../lib/productProfit.js";
+import { nextProductNumber } from "../lib/orderNumber.js";
 
 const router = Router();
 
@@ -104,7 +107,7 @@ router.get("/", async (req, res) => {
         return {
           ...item,
           campaigns: (item.campaigns ?? []).filter(
-            (ref) => !isIgnoredAccount(ref.accountId),
+            (ref) => isKnownBusinessAccount(ref.store, ref.accountId),
           ),
           performance: {
             ...performance,
@@ -157,7 +160,7 @@ router.get("/:id", async (req, res) => {
 
     const safeProduct = product.toObject();
     safeProduct.campaigns = safeProduct.campaigns.filter(
-      (ref) => !isIgnoredAccount(ref.accountId),
+      (ref) => isKnownBusinessAccount(ref.store, ref.accountId),
     );
     return res.status(200).json(safeProduct);
   } catch (error) {
@@ -214,7 +217,7 @@ router.get("/:id/performance", async (req, res) => {
     const campaignRefs = [
       ...new Map(
         (product.campaigns ?? [])
-          .filter((ref) => !isIgnoredAccount(ref.accountId))
+          .filter((ref) => isKnownBusinessAccount(ref.store, ref.accountId))
           .map((ref) => [ref.key, ref]),
       ).values(),
     ].sort((a, b) => a.key.localeCompare(b.key));
@@ -245,6 +248,13 @@ router.get("/:id/performance", async (req, res) => {
       platform: string;
       accountName?: string;
     };
+    type HistoricalCampaignAllocation = {
+      _id: { store: StoreId; accountId: string; campaign: string };
+      spend: number;
+      allocation: number;
+      platform: string;
+      accountName?: string;
+    };
     type LinkedProduct = {
       _id: mongoose.Types.ObjectId;
       campaigns: { key: string }[];
@@ -258,7 +268,14 @@ router.get("/:id/performance", async (req, res) => {
     const statusMatch =
       statusFilter === "all" ? [] : [{ $match: { status: statusFilter } }];
 
-    const [salesRows, statusRows, orderResults, spendRows, linkedRows] =
+    const [
+      salesRows,
+      statusRows,
+      orderResults,
+      spendRows,
+      linkedRows,
+      historicalAllocationRows,
+    ] =
       await Promise.all([
         Order.aggregate<SalesTotals>([
           { $match: { status: "Delivered", "items.productId": productId } },
@@ -316,7 +333,7 @@ router.get("/:id/performance", async (req, res) => {
               {
                 $match: {
                   source: "windsor",
-                  accountId: { $nin: ["1783521163010511"] },
+                  ...excludeUnmappedWindsorAccountsFilter(),
                   $or: campaignRefs.map((ref) => ({
                     store: ref.store,
                     accountId: ref.accountId,
@@ -345,6 +362,36 @@ router.get("/:id/performance", async (req, res) => {
               .select("_id campaigns.key")
               .lean<LinkedProduct[]>()
           : Promise.resolve([] as LinkedProduct[]),
+        AdvertisingExpense.aggregate<HistoricalCampaignAllocation>([
+          {
+            $match: {
+              source: "windsor",
+              ...excludeUnmappedWindsorAccountsFilter(),
+              "allocationSnapshot.products.productId": productId.toString(),
+            },
+          },
+          { $unwind: "$allocationSnapshot.products" },
+          {
+            $match: {
+              "allocationSnapshot.products.productId": productId.toString(),
+            },
+          },
+          {
+            $group: {
+              _id: {
+                store: "$store",
+                accountId: "$accountId",
+                campaign: "$campaign",
+              },
+              spend: { $sum: "$amount" },
+              allocation: {
+                $sum: "$allocationSnapshot.products.amount",
+              },
+              platform: { $first: "$platform" },
+              accountName: { $first: "$accountName" },
+            },
+          },
+        ]),
       ]);
 
     const sales = salesRows[0] ?? {
@@ -367,36 +414,109 @@ router.get("/:id/performance", async (req, res) => {
       }
     }
 
-    const spendByKey = new Map(
-      spendRows.map((row) => [
+    const historicalAllocationByKey = new Map(
+      historicalAllocationRows.map((row) => [
         campaignKeyFor(row._id.store, row._id.accountId, row._id.campaign),
         row,
       ]),
     );
-    const campaigns = campaignRefs.map((ref) => {
-      const linkedIds = [
-        ...(productIdsByCampaign.get(ref.key) ?? new Set([productId.toString()])),
-      ].sort();
-      const spend = spendByKey.get(ref.key);
-      const businessAccount = resolveBusinessAccount(ref.store, ref.accountId);
+    const historicalOnlyRefs = historicalAllocationRows
+      .filter(
+        (row) =>
+          !campaignRefs.some(
+            (current) =>
+              current.key ===
+              campaignKeyFor(
+                row._id.store,
+                row._id.accountId,
+                row._id.campaign,
+              ),
+          ),
+      )
+      .map((row) => row._id);
+    const historicalOnlySpendRows =
+      historicalOnlyRefs.length > 0
+        ? await AdvertisingExpense.aggregate<CampaignSpend>([
+            {
+              $match: {
+                source: "windsor",
+                ...excludeUnmappedWindsorAccountsFilter(),
+                $or: historicalOnlyRefs.map((ref) => ({
+                  store: ref.store,
+                  accountId: ref.accountId,
+                  campaign: ref.campaign,
+                })),
+              },
+            },
+            {
+              $group: {
+                _id: {
+                  store: "$store",
+                  accountId: "$accountId",
+                  campaign: "$campaign",
+                },
+                spend: { $sum: "$amount" },
+                messages: { $sum: { $ifNull: ["$messages", 0] } },
+                clicks: { $sum: { $ifNull: ["$clicks", 0] } },
+                platform: { $first: "$platform" },
+                accountName: { $first: "$accountName" },
+              },
+            },
+          ])
+        : [];
+    const spendByKey = new Map(
+      [...spendRows, ...historicalOnlySpendRows].map((row) => [
+        campaignKeyFor(row._id.store, row._id.accountId, row._id.campaign),
+        row,
+      ]),
+    );
+    const currentCampaignByKey = new Map(
+      campaignRefs.map((campaign) => [campaign.key, campaign]),
+    );
+    const campaignKeys = [
+      ...new Set([
+        ...campaignRefs.map((campaign) => campaign.key),
+        ...historicalAllocationByKey.keys(),
+      ]),
+    ];
+    const campaigns = campaignKeys.flatMap((key) => {
+      const currentRef = currentCampaignByKey.get(key);
+      const allocationRow = historicalAllocationByKey.get(key);
+      const parsed = currentRef ?? (allocationRow
+        ? {
+            ...allocationRow._id,
+            key,
+          }
+        : null);
+      if (!parsed) return [];
 
-      return {
-        key: ref.key,
-        store: ref.store,
-        accountId: ref.accountId,
+      const spend = spendByKey.get(key);
+      const businessAccount = resolveBusinessAccount(
+        parsed.store,
+        parsed.accountId,
+      );
+      if (!businessAccount) return [];
+      const linkedProductCount =
+        productIdsByCampaign.get(key)?.size ?? 0;
+
+      return [{
+        key,
+        store: parsed.store,
+        accountId: parsed.accountId,
         accountKey: businessAccount,
-        accountName: spend?.accountName ?? businessAccount,
-        campaign: ref.campaign,
-        platform: spend?.platform ?? "Meta",
-        spend: round2(spend?.spend ?? 0),
+        accountName:
+          spend?.accountName ??
+          allocationRow?.accountName ??
+          businessAccount,
+        campaign: parsed.campaign,
+        platform: spend?.platform ?? allocationRow?.platform ?? "Meta",
+        spend: round2(spend?.spend ?? allocationRow?.spend ?? 0),
         messages: spend?.messages ?? 0,
         clicks: spend?.clicks ?? 0,
-        linkedProductCount: linkedIds.length,
-        allocation:
-          allocateEvenly(spend?.spend ?? 0, linkedIds.length)[
-            linkedIds.indexOf(productId.toString())
-          ] ?? 0,
-      };
+        linkedProductCount,
+        currentlyLinked: Boolean(currentRef),
+        allocation: round2(allocationRow?.allocation ?? 0),
+      }];
     });
     const advertisingCost = round2(
       campaigns.reduce((sum, campaign) => sum + campaign.allocation, 0),
@@ -497,9 +617,33 @@ router.post("/", async (req, res) => {
       });
     }
 
-    const product = await Product.create(result.data);
+    await captureMissingCampaignAllocations({
+      campaigns: result.data.campaigns ?? [],
+    });
 
-    return res.status(201).json(product);
+    const session = await mongoose.startSession();
+    try {
+      let createdProduct: IProduct | null = null;
+      await session.withTransaction(async () => {
+        const [product] = await Product.create(
+          [
+            {
+              ...result.data,
+              productNumber: await nextProductNumber(session),
+            },
+          ],
+          { session },
+        );
+        createdProduct = product;
+      });
+
+      if (!createdProduct) {
+        throw new Error("Product creation transaction did not return a product");
+      }
+      return res.status(201).json(createdProduct);
+    } finally {
+      await session.endSession();
+    }
   } catch (error) {
     console.error("Failed to create product:", error);
 
@@ -526,6 +670,25 @@ router.put("/:id", async (req, res) => {
       });
     }
 
+    const existing = await Product.findById(req.params.id).lean();
+    if (!existing) {
+      return res.status(404).json({
+        message: "Product not found",
+      });
+    }
+
+    const affectedCampaigns = [
+      ...(existing.campaigns ?? []),
+      ...(result.data.campaigns ?? []),
+    ];
+    await captureMissingCampaignAllocations({
+      campaigns: [
+        ...new Map(
+          affectedCampaigns.map((campaign) => [campaign.key, campaign]),
+        ).values(),
+      ],
+    });
+
     const product = await Product.findByIdAndUpdate(
       req.params.id,
       result.data,
@@ -543,7 +706,7 @@ router.put("/:id", async (req, res) => {
 
     const safeProduct = product.toObject();
     safeProduct.campaigns = safeProduct.campaigns.filter(
-      (ref) => !isIgnoredAccount(ref.accountId),
+      (ref) => isKnownBusinessAccount(ref.store, ref.accountId),
     );
     return res.status(200).json(safeProduct);
   } catch (error) {
@@ -573,7 +736,7 @@ router.get("/:id/campaigns", async (req, res) => {
 
     // Deterministic order; schema transform already dedupes by key.
     const refs = (product.campaigns ?? [])
-      .filter((ref) => !isIgnoredAccount(ref.accountId))
+      .filter((ref) => isKnownBusinessAccount(ref.store, ref.accountId))
       .sort((a, b) =>
       a.key.localeCompare(b.key),
     );
@@ -585,7 +748,7 @@ router.get("/:id/campaigns", async (req, res) => {
         store: ref.store,
         accountId: ref.accountId,
         campaign: ref.campaign,
-        accountKey: resolveBusinessAccount(ref.store, ref.accountId) ?? "trendora_other",
+        accountKey: resolveBusinessAccount(ref.store, ref.accountId),
       })),
     });
   } catch (error) {
@@ -614,6 +777,26 @@ router.post("/:id/campaigns", async (req, res) => {
   const campaignRef = result.data;
 
   try {
+    const productExists = await Product.exists({ _id: req.params.id });
+    if (!productExists) {
+      return res.status(404).json({ message: "Product not found" });
+    }
+
+    const campaignExists = await AdvertisingExpense.exists({
+      source: "windsor",
+      store: campaignRef.store,
+      accountId: campaignRef.accountId,
+      campaign: campaignRef.campaign,
+      ...excludeUnmappedWindsorAccountsFilter(),
+    });
+    if (!campaignExists) {
+      return res.status(404).json({ message: "Campaign not found" });
+    }
+
+    await captureMissingCampaignAllocations({
+      campaigns: [campaignRef],
+    });
+
     const updated = await Product.findByIdAndUpdate(
       req.params.id,
       { $addToSet: { campaigns: campaignRef } },
@@ -653,6 +836,14 @@ router.delete("/:id/campaigns", async (req, res) => {
   }
 
   try {
+    const product = await Product.findById(req.params.id).lean();
+    if (!product) {
+      return res.status(404).json({ message: "Product not found" });
+    }
+    await captureMissingCampaignAllocations({
+      campaigns: product.campaigns ?? [],
+    });
+
     const updated = await Product.findOneAndUpdate(
       { _id: req.params.id, "campaigns.key": result.data.key },
       { $pull: { campaigns: { key: result.data.key } } },
@@ -689,13 +880,18 @@ router.delete("/:id", async (req, res) => {
       });
     }
 
-    const product = await Product.findByIdAndDelete(req.params.id);
+    const existing = await Product.findById(req.params.id).lean();
 
-    if (!product) {
+    if (!existing) {
       return res.status(404).json({
         message: "Product not found",
       });
     }
+
+    await captureMissingCampaignAllocations({
+      campaigns: existing.campaigns ?? [],
+    });
+    await Product.findByIdAndDelete(req.params.id);
 
     return res.status(200).json({
       message: "Product deleted successfully",
