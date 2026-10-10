@@ -85,7 +85,13 @@ export interface IAdvertisingExpense extends Document {
   /** Last successful full sync in which this campaign-day row was returned. */
   lastSeenAt?: Date;
 
-  /** Immutable product mapping for this campaign-day spend record. */
+  /**
+   * LEGACY / DEPRECATED - retained only so existing documents keep their stored
+   * data. Advertising attribution is now computed on read as a CURRENT-STATE
+   * many-to-many split of campaign spend across the products that are currently
+   * linked to it (see lib/campaignAllocation.ts). Nothing reads or writes this
+   * field anymore; it can be dropped in a future cleanup migration.
+   */
   allocationSnapshot?: IAdvertisingExpenseAllocationSnapshot;
 
   createdAt: Date;

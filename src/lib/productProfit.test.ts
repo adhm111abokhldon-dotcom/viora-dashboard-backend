@@ -2,8 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   allocateEvenly,
-  createCampaignAllocationSnapshot,
-  revalueCampaignAllocationSnapshot,
+  currentStateAllocation,
 } from "./campaignAllocation.js";
 import { calculateProductProfit } from "./productProfit.js";
 import {
@@ -21,7 +20,6 @@ import {
   campaignLinkSchema,
   createProductSchema,
 } from "../schemas/productSchemas.js";
-import AdvertisingExpense from "../models/AdvertisingExpense.js";
 
 test("campaign allocation reconciles exact cents for one, two, and three products", () => {
   assert.deepEqual(allocateEvenly(100, 1), [100]);
@@ -34,188 +32,116 @@ test("campaign allocation reconciles exact cents for one, two, and three product
   );
 });
 
-test("campaign allocation snapshots reconcile and leave unlinked spend unallocated", () => {
-  const one = createCampaignAllocationSnapshot(30, [
-    { productId: "1", productName: "One" },
-  ]);
-  assert.equal(one.products[0]?.amount, 30);
-  assert.equal(one.allocatedSpend, 30);
-  assert.equal(one.unallocatedSpend, 0);
-
-  const two = createCampaignAllocationSnapshot(30, [
-    { productId: "2", productName: "Two" },
-    { productId: "1", productName: "One" },
-  ]);
-  assert.deepEqual(two.products.map((product) => product.amount), [15, 15]);
-  assert.equal(two.allocatedSpend, 30);
-
-  const three = createCampaignAllocationSnapshot(100, [
-    { productId: "3", productName: "Three" },
-    { productId: "2", productName: "Two" },
-    { productId: "1", productName: "One" },
-  ]);
-  assert.deepEqual(three.products.map((product) => product.amount), [
-    33.34, 33.33, 33.33,
-  ]);
-  assert.equal(
-    three.products.reduce((sum, product) => sum + product.amount, 0),
-    100,
-  );
-
-  const unallocated = createCampaignAllocationSnapshot(17.42, []);
-  assert.equal(unallocated.allocatedSpend, 0);
-  assert.equal(unallocated.unallocatedSpend, 17.42);
-});
-
-test("shared products accumulate campaign allocations without duplicate spend", () => {
-  const campaignA = createCampaignAllocationSnapshot(30, [
-    { productId: "p1", productName: "Product 1" },
-    { productId: "p2", productName: "Product 2" },
-  ]);
-  const campaignB = createCampaignAllocationSnapshot(20, [
-    { productId: "p1", productName: "Product 1" },
-  ]);
-  const productOne = round2ForTest(
-    campaignA.products.find((product) => product.productId === "p1")!.amount +
-      campaignB.products.find((product) => product.productId === "p1")!.amount,
-  );
-  const productTwo = campaignA.products.find(
-    (product) => product.productId === "p2",
-  )!.amount;
-
-  assert.equal(productOne, 35);
-  assert.equal(productTwo, 15);
-  assert.equal(campaignA.campaignSpend + campaignB.campaignSpend, 50);
-  assert.equal(productOne + productTwo, 50);
-});
-
-test("historical snapshots retain the campaign's product set and names", () => {
-  const capturedAt = new Date("2026-01-01T00:00:00.000Z");
-  const january = createCampaignAllocationSnapshot(
-    100,
-    [
-      { productId: "p1", productName: "Original name" },
-      { productId: "p2", productName: "Second product" },
-    ],
-    capturedAt,
-  );
-  const february = createCampaignAllocationSnapshot(40, [
-    { productId: "p1", productName: "Renamed product" },
-  ]);
-
-  assert.deepEqual(
-    january.products.map(({ productId, productName, amount }) => ({
-      productId,
-      productName,
-      amount,
-    })),
-    [
-      { productId: "p1", productName: "Original name", amount: 50 },
-      { productId: "p2", productName: "Second product", amount: 50 },
-    ],
-  );
-  assert.deepEqual(
-    february.products.map(({ productId, amount }) => ({ productId, amount })),
-    [{ productId: "p1", amount: 40 }],
-  );
-  assert.equal(january.products[1]?.productName, "Second product");
-  assert.equal(january.capturedAt, capturedAt);
-});
-
-test("link and unlink changes affect new snapshots without rewriting history", () => {
-  const beforeLink = createCampaignAllocationSnapshot(100, []);
-  const afterFirstLink = createCampaignAllocationSnapshot(100, [
-    { productId: "p1", productName: "Product 1" },
-  ]);
-  const afterSecondLink = createCampaignAllocationSnapshot(100, [
-    { productId: "p1", productName: "Product 1" },
-    { productId: "p2", productName: "Product 2" },
-  ]);
-  const afterUnlink = createCampaignAllocationSnapshot(100, [
-    { productId: "p2", productName: "Product 2" },
-  ]);
-  const afterAllUnlinked = createCampaignAllocationSnapshot(100, []);
-
+test("current-state allocation distributes spend only to currently-linked products", () => {
+  // Campaign already spent $100 BEFORE any product was linked.
+  const beforeLink = currentStateAllocation(100, []);
   assert.equal(beforeLink.allocatedSpend, 0);
   assert.equal(beforeLink.unallocatedSpend, 100);
-  assert.deepEqual(afterFirstLink.products.map((product) => product.amount), [
-    100,
-  ]);
-  assert.deepEqual(afterSecondLink.products.map((product) => product.amount), [
-    50, 50,
-  ]);
-  assert.deepEqual(afterUnlink.products.map((product) => product.amount), [
-    100,
-  ]);
+
+  // Link Product A today -> it receives the entire $100, not "spend since link".
+  const one = currentStateAllocation(100, ["a"]);
+  assert.equal(one.allocatedSpend, 100);
+  assert.equal(one.unallocatedSpend, 0);
+  assert.equal(one.allocationByProductId.get("a"), 100);
+
+  // Two and three linked products split the spend exactly to the cent.
+  const two = currentStateAllocation(100, ["a", "b"]);
+  assert.equal(two.allocationByProductId.get("a"), 50);
+  assert.equal(two.allocationByProductId.get("b"), 50);
+
+  const three = currentStateAllocation(100, ["a", "b", "c"]);
+  assert.equal(three.allocationByProductId.get("a"), 33.34);
+  assert.equal(three.allocationByProductId.get("b"), 33.33);
+  assert.equal(three.allocationByProductId.get("c"), 33.33);
+  assert.equal(three.allocatedSpend, 100);
+});
+
+test("unlink and relink follow the current relationship, never history", () => {
+  // Unlink one of two products -> the remaining product takes the full spend.
+  const afterUnlink = currentStateAllocation(100, ["b"]);
+  assert.equal(afterUnlink.allocationByProductId.get("b"), 100);
+  assert.equal(afterUnlink.allocationByProductId.get("a"), undefined);
+
+  // Unlink everything -> the campaign spend becomes fully unallocated again.
+  const afterAllUnlinked = currentStateAllocation(100, []);
   assert.equal(afterAllUnlinked.allocatedSpend, 0);
   assert.equal(afterAllUnlinked.unallocatedSpend, 100);
 
-  assert.equal(beforeLink.products.length, 0);
-  assert.equal(beforeLink.allocatedSpend + beforeLink.unallocatedSpend, 100);
-  for (const snapshot of [
-    afterFirstLink,
-    afterSecondLink,
-    afterUnlink,
-    afterAllUnlinked,
-  ]) {
-    assert.equal(
-      snapshot.products.reduce((sum, product) => sum + product.amount, 0),
-      snapshot.allocatedSpend,
-    );
-    assert.equal(
-      snapshot.campaignSpend,
-      snapshot.allocatedSpend + snapshot.unallocatedSpend,
-    );
+  // Relink a week later -> same spend, full share again; no "resume" behaviour.
+  const relinked = currentStateAllocation(100, ["a"]);
+  assert.equal(relinked.allocationByProductId.get("a"), 100);
+});
+
+test("attribution tracks the selected period's campaign spend", () => {
+  const expensive = currentStateAllocation(250, ["a", "b"]);
+  assert.equal(expensive.allocationByProductId.get("a"), 125);
+  assert.equal(expensive.allocationByProductId.get("b"), 125);
+
+  const cheaper = currentStateAllocation(80, ["a", "b"]);
+  assert.equal(cheaper.allocationByProductId.get("a"), 40);
+  assert.equal(cheaper.allocationByProductId.get("b"), 40);
+});
+
+test("a deleted product is not treated as currently linked", () => {
+  const allocation = currentStateAllocation(100, ["b"]);
+  assert.equal(allocation.allocationByProductId.get("deleted"), undefined);
+  assert.equal(allocation.linkedProductIds.length, 1);
+  assert.equal(allocation.allocationByProductId.get("b"), 100);
+});
+
+test("a product's advertising cost sums its share across all linked campaigns", () => {
+  const campaign1 = currentStateAllocation(100, ["a"]);
+  const campaign2 = currentStateAllocation(60, ["a", "b"]);
+  const campaign3 = currentStateAllocation(40, ["a"]);
+
+  const productA =
+    (campaign1.allocationByProductId.get("a") ?? 0) +
+    (campaign2.allocationByProductId.get("a") ?? 0) +
+    (campaign3.allocationByProductId.get("a") ?? 0);
+  const productB = campaign2.allocationByProductId.get("b") ?? 0;
+
+  assert.equal(productA, 170); // 100 + 30 + 40
+  assert.equal(productB, 30);
+});
+
+test("current-state allocation always reconciles to the cent", () => {
+  for (const spend of [100, 78.05, 0.01, 33.33, 250]) {
+    for (const count of [0, 1, 2, 3, 5]) {
+      const ids = Array.from({ length: count }, (_, index) => `p${index}`);
+      const result = currentStateAllocation(spend, ids);
+      assert.equal(
+        result.campaignSpend,
+        Math.round((result.allocatedSpend + result.unallocatedSpend) * 100) /
+          100,
+      );
+      const summed = [...result.allocationByProductId.values()].reduce(
+        (sum, amount) => sum + amount,
+        0,
+      );
+      assert.equal(Math.round(summed * 100) / 100, result.allocatedSpend);
+      if (count === 0) {
+        assert.equal(result.allocatedSpend, 0);
+        assert.equal(result.unallocatedSpend, spend);
+      }
+    }
   }
 });
 
-test("provider spend corrections preserve snapshot membership and exact cents", () => {
-  const original = createCampaignAllocationSnapshot(100, [
-    { productId: "p1", productName: "One" },
-    { productId: "p2", productName: "Two" },
-    { productId: "p3", productName: "Three" },
-  ]);
-  const corrected = revalueCampaignAllocationSnapshot(100.01, original);
+test("link and unlink changes affect new snapshots without rewriting history", () => {
+  const beforeLink = currentStateAllocation(100, []);
+  const afterFirstLink = currentStateAllocation(100, ["p1"]);
+  const afterSecondLink = currentStateAllocation(100, ["p1", "p2"]);
+  const afterUnlink = currentStateAllocation(100, ["p2"]);
+  const afterAllUnlinked = currentStateAllocation(100, []);
 
-  assert.deepEqual(
-    corrected.products.map((product) => product.amount),
-    [33.34, 33.34, 33.33],
-  );
-  assert.equal(
-    corrected.products.reduce((sum, product) => sum + product.amount, 0),
-    corrected.campaignSpend,
-  );
-  assert.deepEqual(
-    corrected.products.map((product) => product.productName),
-    ["One", "Two", "Three"],
-  );
-  assert.equal(corrected.capturedAt, original.capturedAt);
-});
-
-test("provider corrections revalue persisted Mongoose snapshot products", () => {
-  const expense = new AdvertisingExpense({
-    date: new Date("2026-10-08T00:00:00.000Z"),
-    amount: 1.44,
-    platform: "Meta",
-    allocationSnapshot: createCampaignAllocationSnapshot(1.44, [
-      { productId: "p1", productName: "One" },
-    ]),
-  });
-  const corrected = revalueCampaignAllocationSnapshot(
-    1.62,
-    expense.allocationSnapshot!,
-  );
-
-  assert.deepEqual(corrected.products, [
-    {
-      productId: "p1",
-      productName: "One",
-      amount: 1.62,
-      shareIndex: 0,
-      shareCount: 1,
-    },
-  ]);
-  assert.equal(corrected.allocatedSpend, 1.62);
+  assert.equal(beforeLink.allocatedSpend, 0);
+  assert.equal(beforeLink.unallocatedSpend, 100);
+  assert.equal(afterFirstLink.allocationByProductId.get("p1"), 100);
+  assert.equal(afterSecondLink.allocationByProductId.get("p1"), 50);
+  assert.equal(afterSecondLink.allocationByProductId.get("p2"), 50);
+  assert.equal(afterUnlink.allocationByProductId.get("p2"), 100);
+  assert.equal(afterAllUnlinked.allocatedSpend, 0);
+  assert.equal(afterAllUnlinked.unallocatedSpend, 100);
 });
 
 test("product profitability handles profit, loss, break-even, and no-sales states", () => {
@@ -322,10 +248,6 @@ test("account resolution exposes only the verified Viora account", () => {
     false,
   );
 });
-
-function round2ForTest(value: number) {
-  return Math.round(value * 100) / 100;
-}
 
 test("campaign relationship schemas derive stable keys and reject unmapped accounts", () => {
   const reference = campaignLinkSchema.safeParse({

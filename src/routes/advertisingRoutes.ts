@@ -48,9 +48,8 @@ import {
   type BusinessAccountKey,
 } from "../lib/adAccounts.js";
 import Product from "../models/Product.js";
-import { revalueCampaignAllocationSnapshot } from "../lib/campaignAllocation.js";
+import { currentStateAllocation } from "../lib/campaignAllocation.js";
 import WindsorSyncState from "../models/WindsorSyncState.js";
-import { captureMissingCampaignAllocations } from "../lib/advertisingAllocationSnapshots.js";
 import {
   emptyCampaignCatalogStateCounts,
   getCampaignCatalogState,
@@ -180,8 +179,6 @@ router.get("/campaigns", async (req, res) => {
       AdvertisingExpense.aggregate<{
         _id: { store?: string; accountId?: string; campaign: string };
         spend: number;
-        allocatedSpend: number;
-        unallocatedSpend: number;
         messages: number;
         clicks: number;
         platform: string;
@@ -202,9 +199,6 @@ router.get("/campaigns", async (req, res) => {
               campaign: "$campaign",
             },
             spend: { $sum: "$amount" },
-            allocatedSpend: {
-              $sum: { $ifNull: ["$allocationSnapshot.allocatedSpend", 0] },
-            },
             messages: { $sum: { $ifNull: ["$messages", 0] } },
             clicks: { $sum: { $ifNull: ["$clicks", 0] } },
             platform: { $first: "$platform" },
@@ -261,7 +255,6 @@ router.get("/campaigns", async (req, res) => {
         providerState,
       );
       const spend = round2(row.spend);
-      const allocatedSpend = round2(row.allocatedSpend);
       return [
         {
           key,
@@ -279,8 +272,6 @@ router.get("/campaigns", async (req, res) => {
           lastActivity: row.lastActivity ?? null,
           lastSeenAt,
           spend,
-          allocatedSpend,
-          unallocatedSpend: round2(spend - allocatedSpend),
           messages: row.messages,
           clicks: row.clicks,
           costPerMessage: roundedRatio(row.spend, row.messages),
@@ -307,10 +298,19 @@ router.get("/campaigns", async (req, res) => {
           ])
         : [];
     const countByKey = new Map(linkedCounts.map((row) => [row._id, row.count]));
-    const campaigns = pageCampaigns.map((campaign) => ({
-      ...campaign,
-      linkedProductCount: countByKey.get(campaign.key) ?? 0,
-    }));
+    const campaigns = pageCampaigns.map((campaign) => {
+      // Current-state attribution: a campaign's spend is allocated only when
+      // products are CURRENTLY linked to it; with zero links it is fully
+      // unallocated. No link-time or historical snapshot logic.
+      const linkedProductCount = countByKey.get(campaign.key) ?? 0;
+      const allocatedSpend = linkedProductCount > 0 ? campaign.spend : 0;
+      return {
+        ...campaign,
+        linkedProductCount,
+        allocatedSpend,
+        unallocatedSpend: round2(campaign.spend - allocatedSpend),
+      };
+    });
 
     const totalCampaigns = allCampaigns.length;
     const totalPages = Math.ceil(totalCampaigns / limit);
@@ -376,7 +376,6 @@ router.get("/campaigns/:key/products", async (req, res) => {
     const [spendRows, totalProducts, products, linkedProductRows, syncState] = await Promise.all([
       AdvertisingExpense.aggregate<{
         spend: number;
-        allocatedSpend: number;
         messages: number;
         clicks: number;
         platform: string;
@@ -401,17 +400,6 @@ router.get("/campaigns/:key/products", async (req, res) => {
           $group: {
             _id: null,
             spend: { $sum: "$amount" },
-            allocatedSpend: {
-              $sum: { $ifNull: ["$allocationSnapshot.allocatedSpend", 0] },
-            },
-            unallocatedSpend: {
-              $sum: {
-                $ifNull: [
-                  "$allocationSnapshot.unallocatedSpend",
-                  "$amount",
-                ],
-              },
-            },
             messages: { $sum: { $ifNull: ["$messages", 0] } },
             clicks: { $sum: { $ifNull: ["$clicks", 0] } },
             platform: { $first: "$platform" },
@@ -451,41 +439,15 @@ router.get("/campaigns/:key/products", async (req, res) => {
     const linkedProductIds = linkedProductRows.map((product) =>
       product._id.toString(),
     );
-    const historicalAllocations = await AdvertisingExpense.aggregate<{
-      _id: { productId: string; productName: string };
-      amount: number;
-    }>([
-      {
-        $match: {
-          source: "windsor",
-          store: campaignRef.store,
-          accountId: campaignRef.accountId,
-          campaign: campaignRef.campaign,
-          ...excludeUnmappedWindsorAccountsFilter(),
-        },
-      },
-      { $unwind: "$allocationSnapshot.products" },
-      {
-        $group: {
-          _id: {
-            productId: "$allocationSnapshot.products.productId",
-            productName: "$allocationSnapshot.products.productName",
-          },
-          amount: { $sum: "$allocationSnapshot.products.amount" },
-        },
-      },
-      { $sort: { "_id.productName": 1, "_id.productId": 1 } },
-    ]);
-    const allocationByProductId = new Map<string, number>();
-    for (const allocation of historicalAllocations) {
-      allocationByProductId.set(
-        allocation._id.productId,
-        round2(
-          (allocationByProductId.get(allocation._id.productId) ?? 0) +
-            allocation.amount,
-        ),
-      );
-    }
+    const campaignSpend = round2(spend?.spend ?? 0);
+    /*
+     * Current-state attribution: the campaign's spend for the selected period
+     * is divided equally among the products CURRENTLY linked to it. Linking a
+     * product today gives it its full share immediately - there is no
+     * "spend since linked" behaviour and no historical snapshot.
+     */
+    const { allocatedSpend, unallocatedSpend, allocationByProductId } =
+      currentStateAllocation(campaignSpend, linkedProductIds);
     const providerState = getCampaignProviderState(
       spend?.lastSeenAt,
       syncState?.lastSuccessfulSyncAt,
@@ -494,8 +456,6 @@ router.get("/campaigns/:key/products", async (req, res) => {
       spend?.campaignEffectiveStatus,
       providerState,
     );
-    const campaignSpend = round2(spend?.spend ?? 0);
-    const allocatedSpend = round2(spend?.allocatedSpend ?? 0);
     const totalPages = Math.ceil(totalProducts / limit);
     return res.status(200).json({
       campaign: {
@@ -516,7 +476,7 @@ router.get("/campaigns/:key/products", async (req, res) => {
         lastSeenAt: spend?.lastSeenAt ?? null,
         spend: campaignSpend,
         allocatedSpend,
-        unallocatedSpend: round2(campaignSpend - allocatedSpend),
+        unallocatedSpend,
         messages: spend?.messages ?? 0,
         clicks: spend?.clicks ?? 0,
         costPerMessage: roundedRatio(spend?.spend ?? 0, spend?.messages ?? 0),
@@ -531,13 +491,9 @@ router.get("/campaigns/:key/products", async (req, res) => {
         cost: product.cost,
         stock: product.stock,
         linked: (product.campaigns ?? []).some((ref) => ref.key === key),
-        allocation: allocationByProductId.get(product._id.toString()) ?? null,
-      })),
-      historicalAllocations: historicalAllocations.map((allocation) => ({
-        productId: allocation._id.productId,
-        productName: allocation._id.productName,
-        amount: round2(allocation.amount),
-        linked: linkedProductIds.includes(allocation._id.productId),
+        // Current share of this campaign's spend (0 when not linked).
+        allocation:
+          allocationByProductId.get(product._id.toString()) ?? 0,
       })),
       pagination: {
         currentPage: page,
@@ -1100,12 +1056,6 @@ router.post("/windsor/sync", async (_req, res) => {
     const rows = result.connections
       .flatMap((c) => c.rows)
       .filter((row) => isKnownBusinessAccount(row.store, row.accountId));
-    const successfulConnections = result.connections.map(
-      (connection) => connection.connectionId,
-    );
-    await captureMissingCampaignAllocations({
-      connectionIds: successfulConnections,
-    });
 
     let created = 0;
     let updated = 0;
@@ -1244,28 +1194,9 @@ router.post("/windsor/sync", async (_req, res) => {
 
       updated += 1;
 
-      const priorSnapshot = updatedDoc.value?.allocationSnapshot;
-      if (priorSnapshot) {
-        await AdvertisingExpense.updateOne(
-          { _id: updatedDoc.value?._id },
-          {
-            $set: {
-              allocationSnapshot: revalueCampaignAllocationSnapshot(
-                amount,
-                priorSnapshot,
-              ),
-            },
-          },
-        );
-      }
-
       // "unchanged" = Windsor re-reported the identical stored amount.
       if (round2(updatedDoc.value?.amount ?? NaN) === amount) unchanged += 1;
     }
-
-    await captureMissingCampaignAllocations({
-      connectionIds: successfulConnections,
-    });
 
     await Promise.all(
       result.connections.map((connection) =>
@@ -1358,9 +1289,6 @@ router.get("/insights", async (_req, res) => {
           $group: {
             _id: { store: "$store", accountId: "$accountId" },
             spend: { $sum: "$amount" },
-            allocatedSpend: {
-              $sum: { $ifNull: ["$allocationSnapshot.allocatedSpend", 0] },
-            },
             messages: { $sum: { $ifNull: ["$messages", 0] } },
             clicks: { $sum: { $ifNull: ["$clicks", 0] } },
           },
@@ -1368,8 +1296,8 @@ router.get("/insights", async (_req, res) => {
         { $sort: { spend: -1, _id: 1 } },
       ]),
 
-      // Campaign counts only; campaign details are served through the
-      // paginated catalog endpoint instead of embedding every row here.
+      // Per-campaign spend + status. Allocated spend is derived below from the
+      // CURRENT linked-product counts, not from any stored snapshot.
       AdvertisingExpense.aggregate([
         {
           $match: {
@@ -1386,6 +1314,7 @@ router.get("/insights", async (_req, res) => {
               accountId: "$accountId",
               campaign: "$campaign",
             },
+            spend: { $sum: "$amount" },
             campaignEffectiveStatus: { $last: "$campaignEffectiveStatus" },
             lastSeenAt: { $max: "$lastSeenAt" },
           },
@@ -1449,13 +1378,13 @@ router.get("/insights", async (_req, res) => {
     type AccountAggRow = {
       _id: { store: string | null; accountId: string | null };
       spend: number;
-      allocatedSpend: number;
       messages: number;
       clicks: number;
     };
 
     type CampaignAggRow = {
       _id: { store: "viora" | null; accountId: string | null; campaign: string };
+      spend: number;
       campaignEffectiveStatus?: string | null;
       lastSeenAt?: Date | null;
     };
@@ -1465,12 +1394,35 @@ router.get("/insights", async (_req, res) => {
       if (!bucket) continue;
 
       bucket.spend += row.spend;
-      bucket.allocatedSpend += row.allocatedSpend ?? 0;
       bucket.messages += row.messages ?? 0;
       bucket.clicks += row.clicks ?? 0;
     }
 
     const lastSuccessfulSyncAt = syncStates[0]?.lastSuccessfulSyncAt;
+
+    /*
+     * Current-state attributed spend per account = the sum of each campaign's
+     * spend that has at least one CURRENTLY linked product. Campaigns with no
+     * linked product contribute their spend to unallocated, never to allocated.
+     */
+    const campaignKeys = (campaignAgg as CampaignAggRow[])
+      .map((row) =>
+        row._id.store && row._id.accountId
+          ? campaignKeyFor(row._id.store, row._id.accountId, row._id.campaign)
+          : null,
+      )
+      .filter((key): key is string => key !== null);
+    const linkedCountRows =
+      campaignKeys.length > 0
+        ? await Product.aggregate<{ _id: string; count: number }>([
+            { $unwind: "$campaigns" },
+            { $match: { "campaigns.key": { $in: campaignKeys } } },
+            { $group: { _id: "$campaigns.key", count: { $sum: 1 } } },
+          ])
+        : [];
+    const linkedCountByKey = new Map(
+      linkedCountRows.map((row) => [row._id, row.count]),
+    );
 
     for (const row of campaignAgg as CampaignAggRow[]) {
       const bucket = bucketFor(row._id.store, row._id.accountId);
@@ -1488,6 +1440,16 @@ router.get("/insights", async (_req, res) => {
       );
       bucket.campaignCount += 1;
       bucket.campaignStateCounts[catalogState] += 1;
+      const key =
+        row._id.store && row._id.accountId
+          ? campaignKeyFor(row._id.store, row._id.accountId, row._id.campaign)
+          : null;
+      const linkedCount = key ? (linkedCountByKey.get(key) ?? 0) : 0;
+      // A campaign contributes its full spend to allocated only when it has at
+      // least one CURRENTLY linked product (same rule as currentStateAllocation).
+      if (linkedCount > 0) {
+        bucket.allocatedSpend += round2(row.spend);
+      }
     }
 
     const accounts = BUSINESS_ACCOUNT_KEYS.filter((key) => buckets.has(key)).map(

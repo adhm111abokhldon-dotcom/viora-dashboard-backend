@@ -1,10 +1,19 @@
 import { round2 } from "./money.js";
 
 /**
- * Advertising cost allocation: a campaign's total spend is divided EQUALLY
- * between its linked products.
+ * CURRENT-STATE campaign/product advertising attribution.
  *
- *   Product Campaign Share = Campaign Total Spend / Number of Linked Products
+ * A campaign's spend for the selected reporting period is divided EQUALLY
+ * between the products that are CURRENTLY linked to it:
+ *
+ *     Product Campaign Share = Campaign Spend / Number of Currently Linked Products
+ *
+ * The relationship is a pure many-to-many "linked = included, unlinked =
+ * excluded" rule. The amount a product receives does NOT depend on when it
+ * was linked or unlinked, on any link timestamp, or on any stored snapshot:
+ * linking a product today gives it its full share of the campaign's spend
+ * for the requested period immediately, even spend that occurred before the
+ * link existed.
  *
  * Allocation is ANALYTICAL ONLY - it never changes the campaign's own spend.
  * A $100 campaign with two products still spent $100 on the Advertising page;
@@ -16,6 +25,7 @@ import { round2 } from "./money.js";
  * same order every caller uses: sorted product ids).
  *
  *   $100 over 3 -> [33.34, 33.33, 33.33]  (sum = 100.00 exactly)
+ *   $0.01 over 3 -> [0.01, 0.00, 0.00]    (sum = 0.01 exactly)
  */
 
 /**
@@ -40,90 +50,49 @@ export function allocateEvenly(total: number, count: number): number[] {
   });
 }
 
-/**
- * This product's share of one campaign's spend.
- *
- * `index` is the product's position in the campaign's SORTED linked-product
- * list - every endpoint sorts by product id ascending first, so the
- * product-facing number and the campaign-facing table always agree.
- */
-export function allocatedShareAt(
-  total: number,
-  count: number,
-  index: number,
-): number {
-  if (index < 0 || index >= count) return 0;
-
-  return allocateEvenly(total, count)[index] ?? 0;
-}
-
-export type AllocationProduct = {
-  productId: string;
-  productName: string;
-  amount: number;
-  shareIndex: number;
-  shareCount: number;
-};
-
-export type CampaignAllocationSnapshot = {
+export type CurrentStateAllocation = {
   campaignSpend: number;
+  /** Spend assigned to products (equals campaignSpend when >= 1 product). */
   allocatedSpend: number;
+  /** Spend with no currently-linked product (equals campaignSpend when 0). */
   unallocatedSpend: number;
-  capturedAt: Date;
-  products: AllocationProduct[];
+  /** Product id -> its exact-cent share of the campaign spend. */
+  allocationByProductId: Map<string, number>;
+  /** The de-duplicated, id-sorted list of products that received a share. */
+  linkedProductIds: string[];
 };
 
-export function createCampaignAllocationSnapshot(
+/**
+ * THE single authoritative campaign -> current-products attribution.
+ *
+ * Given the campaign's spend for the selected reporting period and the ids of
+ * the products CURRENTLY linked to it, distribute the spend equally and
+ * exactly. This is the ONLY place campaign spend is turned into per-product
+ * allocation; every endpoint (catalog, campaign detail, insights, product
+ * performance) routes through it so the numbers can never disagree.
+ */
+export function currentStateAllocation(
   campaignSpend: number,
-  products: Array<{ productId: string; productName: string }>,
-  capturedAt = new Date(),
-): CampaignAllocationSnapshot {
-  const ordered = [...products].sort((left, right) =>
-    left.productId.localeCompare(right.productId),
+  linkedProductIds: readonly string[],
+): CurrentStateAllocation {
+  const spend = round2(campaignSpend);
+  // De-duplicate and sort by id so the exact-cent remainder lands on the same
+  // products no matter which caller (or product) is asking.
+  const ordered = [...new Set(linkedProductIds)].sort((left, right) =>
+    left.localeCompare(right),
   );
-  const amounts = allocateEvenly(campaignSpend, ordered.length);
-  const allocatedSpend = round2(
-    amounts.reduce((sum, amount) => sum + amount, 0),
-  );
+  const amounts = allocateEvenly(spend, ordered.length);
+  const allocationByProductId = new Map<string, number>();
+  ordered.forEach((productId, index) => {
+    allocationByProductId.set(productId, amounts[index] ?? 0);
+  });
+  const allocatedSpend = ordered.length > 0 ? spend : 0;
 
   return {
-    campaignSpend: round2(campaignSpend),
+    campaignSpend: spend,
     allocatedSpend,
-    unallocatedSpend:
-      ordered.length === 0 ? round2(campaignSpend) : 0,
-    capturedAt,
-    products: ordered.map((product, index) => ({
-      ...product,
-      amount: amounts[index] ?? 0,
-      shareIndex: index,
-      shareCount: ordered.length,
-    })),
-  };
-}
-
-/** Revalue provider-corrected spend without changing the captured product set. */
-export function revalueCampaignAllocationSnapshot(
-  campaignSpend: number,
-  snapshot: CampaignAllocationSnapshot,
-): CampaignAllocationSnapshot {
-  const amounts = allocateEvenly(campaignSpend, snapshot.products.length);
-  const products = snapshot.products.map((product, index) => ({
-    productId: product.productId,
-    productName: product.productName,
-    amount: amounts[index] ?? 0,
-    shareIndex: index,
-    shareCount: snapshot.products.length,
-  }));
-  const allocatedSpend = round2(
-    products.reduce((sum, product) => sum + product.amount, 0),
-  );
-
-  return {
-    campaignSpend: round2(campaignSpend),
-    allocatedSpend,
-    unallocatedSpend:
-      products.length === 0 ? round2(campaignSpend) : 0,
-    capturedAt: snapshot.capturedAt,
-    products,
+    unallocatedSpend: round2(spend - allocatedSpend),
+    allocationByProductId,
+    linkedProductIds: ordered,
   };
 }
