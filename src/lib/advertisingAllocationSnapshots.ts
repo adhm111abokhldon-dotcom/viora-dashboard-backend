@@ -33,8 +33,9 @@ type ProductRow = {
 };
 
 /**
- * Freeze allocations for unsnapshotted Windsor spend before campaign links
- * change. Rows without products remain explicitly unallocated.
+ * Capture unsnapshotted Windsor spend against the currently persisted links.
+ * Callers that remove or replace links must capture the old state first;
+ * newly added links are captured only after they are persisted.
  */
 export async function captureMissingCampaignAllocations(options?: {
   connectionIds?: string[];

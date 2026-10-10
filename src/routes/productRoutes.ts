@@ -3,6 +3,7 @@ import Product from "../models/Product.js";
 import type { IProduct } from "../models/Product.js";
 import Order from "../models/Orders.js";
 import AdvertisingExpense from "../models/AdvertisingExpense.js";
+import WindsorSyncState from "../models/WindsorSyncState.js";
 import mongoose from "mongoose";
 import {
   createProductSchema,
@@ -29,6 +30,11 @@ import {
 import { round2 } from "../lib/money.js";
 import { calculateProductProfit } from "../lib/productProfit.js";
 import { nextProductNumber } from "../lib/orderNumber.js";
+import { productDeletionCheck } from "../lib/orderLifecycle.js";
+import {
+  getCampaignCatalogState,
+  getCampaignProviderState,
+} from "../lib/campaignState.js";
 
 const router = Router();
 
@@ -243,10 +249,16 @@ router.get("/:id/performance", async (req, res) => {
     type CampaignSpend = {
       _id: { store: StoreId; accountId: string; campaign: string };
       spend: number;
+      allocatedSpend: number;
       messages: number;
       clicks: number;
       platform: string;
       accountName?: string;
+      campaignEffectiveStatus?: string | null;
+      campaignConfiguredStatus?: string | null;
+      firstActivity?: Date | null;
+      lastActivity?: Date | null;
+      lastSeenAt?: Date | null;
     };
     type HistoricalCampaignAllocation = {
       _id: { store: StoreId; accountId: string; campaign: string };
@@ -341,6 +353,7 @@ router.get("/:id/performance", async (req, res) => {
                   })),
                 },
               },
+              { $sort: { lastSeenAt: 1, date: 1, _id: 1 } },
               {
                 $group: {
                   _id: {
@@ -349,10 +362,24 @@ router.get("/:id/performance", async (req, res) => {
                     campaign: "$campaign",
                   },
                   spend: { $sum: "$amount" },
+                  allocatedSpend: {
+                    $sum: {
+                      $ifNull: ["$allocationSnapshot.allocatedSpend", 0],
+                    },
+                  },
                   messages: { $sum: { $ifNull: ["$messages", 0] } },
                   clicks: { $sum: { $ifNull: ["$clicks", 0] } },
                   platform: { $first: "$platform" },
                   accountName: { $first: "$accountName" },
+                  campaignEffectiveStatus: {
+                    $last: "$campaignEffectiveStatus",
+                  },
+                  campaignConfiguredStatus: {
+                    $last: "$campaignConfiguredStatus",
+                  },
+                  firstActivity: { $min: "$date" },
+                  lastActivity: { $max: "$date" },
+                  lastSeenAt: { $max: "$lastSeenAt" },
                 },
               },
             ])
@@ -414,6 +441,12 @@ router.get("/:id/performance", async (req, res) => {
       }
     }
 
+    const syncState = await WindsorSyncState.findOne({
+      connectionId: "viora-windsor",
+    })
+      .select("connectionId lastSuccessfulSyncAt")
+      .lean();
+
     const historicalAllocationByKey = new Map(
       historicalAllocationRows.map((row) => [
         campaignKeyFor(row._id.store, row._id.accountId, row._id.campaign),
@@ -448,6 +481,7 @@ router.get("/:id/performance", async (req, res) => {
                 })),
               },
             },
+            { $sort: { lastSeenAt: 1, date: 1, _id: 1 } },
             {
               $group: {
                 _id: {
@@ -456,10 +490,24 @@ router.get("/:id/performance", async (req, res) => {
                   campaign: "$campaign",
                 },
                 spend: { $sum: "$amount" },
+                allocatedSpend: {
+                  $sum: {
+                    $ifNull: ["$allocationSnapshot.allocatedSpend", 0],
+                  },
+                },
                 messages: { $sum: { $ifNull: ["$messages", 0] } },
                 clicks: { $sum: { $ifNull: ["$clicks", 0] } },
                 platform: { $first: "$platform" },
                 accountName: { $first: "$accountName" },
+                campaignEffectiveStatus: {
+                  $last: "$campaignEffectiveStatus",
+                },
+                campaignConfiguredStatus: {
+                  $last: "$campaignConfiguredStatus",
+                },
+                firstActivity: { $min: "$date" },
+                lastActivity: { $max: "$date" },
+                lastSeenAt: { $max: "$lastSeenAt" },
               },
             },
           ])
@@ -498,6 +546,15 @@ router.get("/:id/performance", async (req, res) => {
       if (!businessAccount) return [];
       const linkedProductCount =
         productIdsByCampaign.get(key)?.size ?? 0;
+      const campaignSpend = round2(
+        spend?.spend ?? allocationRow?.spend ?? 0,
+      );
+      const campaignAllocatedSpend = round2(spend?.allocatedSpend ?? 0);
+      const lastSeenAt = spend?.lastSeenAt ?? null;
+      const providerState = getCampaignProviderState(
+        lastSeenAt,
+        syncState?.lastSuccessfulSyncAt,
+      );
 
       return [{
         key,
@@ -510,12 +567,24 @@ router.get("/:id/performance", async (req, res) => {
           businessAccount,
         campaign: parsed.campaign,
         platform: spend?.platform ?? allocationRow?.platform ?? "Meta",
-        spend: round2(spend?.spend ?? allocationRow?.spend ?? 0),
+        spend: campaignSpend,
+        allocatedSpend: campaignAllocatedSpend,
+        unallocatedSpend: round2(campaignSpend - campaignAllocatedSpend),
         messages: spend?.messages ?? 0,
         clicks: spend?.clicks ?? 0,
         linkedProductCount,
         currentlyLinked: Boolean(currentRef),
         allocation: round2(allocationRow?.allocation ?? 0),
+        status: spend?.campaignEffectiveStatus ?? null,
+        configuredStatus: spend?.campaignConfiguredStatus ?? null,
+        providerState,
+        catalogState: getCampaignCatalogState(
+          spend?.campaignEffectiveStatus,
+          providerState,
+        ),
+        firstActivity: spend?.firstActivity ?? null,
+        lastActivity: spend?.lastActivity ?? null,
+        lastSeenAt,
       }];
     });
     const advertisingCost = round2(
@@ -617,10 +686,6 @@ router.post("/", async (req, res) => {
       });
     }
 
-    await captureMissingCampaignAllocations({
-      campaigns: result.data.campaigns ?? [],
-    });
-
     const session = await mongoose.startSession();
     try {
       let createdProduct: IProduct | null = null;
@@ -640,6 +705,9 @@ router.post("/", async (req, res) => {
       if (!createdProduct) {
         throw new Error("Product creation transaction did not return a product");
       }
+      await captureMissingCampaignAllocations({
+        campaigns: result.data.campaigns ?? [],
+      });
       return res.status(201).json(createdProduct);
     } finally {
       await session.endSession();
@@ -677,16 +745,9 @@ router.put("/:id", async (req, res) => {
       });
     }
 
-    const affectedCampaigns = [
-      ...(existing.campaigns ?? []),
-      ...(result.data.campaigns ?? []),
-    ];
+    const existingCampaigns = existing.campaigns ?? [];
     await captureMissingCampaignAllocations({
-      campaigns: [
-        ...new Map(
-          affectedCampaigns.map((campaign) => [campaign.key, campaign]),
-        ).values(),
-      ],
+      campaigns: existingCampaigns,
     });
 
     const product = await Product.findByIdAndUpdate(
@@ -703,6 +764,12 @@ router.put("/:id", async (req, res) => {
         message: "Product not found",
       });
     }
+
+    const existingKeys = new Set(existingCampaigns.map((campaign) => campaign.key));
+    const addedCampaigns = (result.data.campaigns ?? []).filter(
+      (campaign) => !existingKeys.has(campaign.key),
+    );
+    await captureMissingCampaignAllocations({ campaigns: addedCampaigns });
 
     const safeProduct = product.toObject();
     safeProduct.campaigns = safeProduct.campaigns.filter(
@@ -793,10 +860,6 @@ router.post("/:id/campaigns", async (req, res) => {
       return res.status(404).json({ message: "Campaign not found" });
     }
 
-    await captureMissingCampaignAllocations({
-      campaigns: [campaignRef],
-    });
-
     const updated = await Product.findByIdAndUpdate(
       req.params.id,
       { $addToSet: { campaigns: campaignRef } },
@@ -806,6 +869,10 @@ router.post("/:id/campaigns", async (req, res) => {
     if (!updated) {
       return res.status(404).json({ message: "Product not found" });
     }
+
+    await captureMissingCampaignAllocations({
+      campaigns: [campaignRef],
+    });
 
     return res.status(200).json({
       product: { _id: updated._id.toString(), name: updated.name, category: updated.category },
@@ -880,7 +947,9 @@ router.delete("/:id", async (req, res) => {
       });
     }
 
-    const existing = await Product.findById(req.params.id).lean();
+    const productId = new mongoose.Types.ObjectId(req.params.id);
+
+    const existing = await Product.findById(productId).lean();
 
     if (!existing) {
       return res.status(404).json({
@@ -888,10 +957,27 @@ router.delete("/:id", async (req, res) => {
       });
     }
 
+    /*
+     * A Pending order holds reserved stock against this product document.
+     * Deleting the product would leave that reservation impossible to
+     * release on a later cancel/edit - block until those orders leave the
+     * Pending state. Delivered/Cancelled orders only reference historical
+     * snapshots, so they never block deletion.
+     */
+    const pendingOrder = await Order.exists({
+      status: "Pending",
+      "items.productId": productId,
+    });
+    const deletion = productDeletionCheck(pendingOrder !== null);
+
+    if (deletion.blocked) {
+      return res.status(400).json({ message: deletion.message });
+    }
+
     await captureMissingCampaignAllocations({
       campaigns: existing.campaigns ?? [],
     });
-    await Product.findByIdAndDelete(req.params.id);
+    await Product.findByIdAndDelete(productId);
 
     return res.status(200).json({
       message: "Product deleted successfully",

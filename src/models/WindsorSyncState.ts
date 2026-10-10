@@ -1,7 +1,7 @@
 import mongoose, { Schema } from "mongoose";
 
 export interface IWindsorSyncState {
-  connectionId: "viora-windsor" | "trendora-windsor";
+  connectionId: "viora-windsor";
   /** Timestamp also written to every Windsor row returned by this sync. */
   lastSuccessfulSyncAt: Date;
   historyFrom: string | null;
@@ -13,7 +13,7 @@ const windsorSyncStateSchema = new Schema<IWindsorSyncState>(
   {
     connectionId: {
       type: String,
-      enum: ["viora-windsor", "trendora-windsor"],
+      enum: ["viora-windsor"],
       required: true,
       unique: true,
     },

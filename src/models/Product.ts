@@ -8,7 +8,7 @@ export interface ICampaignRef {
    * Querying goes through this key so campaign names containing "|" are safe.
    */
   key: string;
-  store: "viora" | "trendora";
+  store: "viora";
   /** Windsor ad account id (business account resolved at read time). */
   accountId: string;
   /** Campaign display name exactly as reported by Windsor. */
@@ -38,7 +38,7 @@ export interface IProduct extends Document {
 const campaignRefSchema = new Schema<ICampaignRef>(
   {
     key: { type: String, required: true, trim: true },
-    store: { type: String, enum: ["viora", "trendora"], required: true },
+    store: { type: String, enum: ["viora"], required: true },
     accountId: { type: String, required: true, trim: true },
     campaign: { type: String, required: true, trim: true },
   },

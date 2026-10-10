@@ -1,16 +1,8 @@
 /**
  * Read-only Windsor.ai (Meta) connector.
  *
- * Two independent connections, one per store:
- *
- *   WINDSOR_VIORA_API_KEY      -> Viora
- *   WINDSOR_TRENDORA_API_KEY   -> Trendora
- *
- * IMPORTANT: one connection is NOT one advertising account. The Trendora
- * connection returns two ad accounts in a single response (one ACTIVE, one
- * DISABLED). Every row therefore carries its own `accountId`/`accountName`,
- * and the external key includes both, so one account can never overwrite or
- * shadow the other.
+ * One Viora Windsor connection. Account identity is still kept on every row
+ * and validated against the verified Viora account mapping before storage.
  *
  * Keys are read from the backend env only. They are never returned to the
  * client, never logged, and never placed in a URL that leaves the server.
@@ -44,7 +36,7 @@ export const WINDSOR_MAX_HISTORY_MONTHS = 36;
  */
 const HISTORY_LADDER_MONTHS = [36, 13, 6] as const;
 
-export type StoreId = "viora" | "trendora";
+export type StoreId = "viora";
 
 export const WINDSOR_FIELDS = {
   date: "date",
@@ -57,7 +49,7 @@ export const WINDSOR_FIELDS = {
   accountId: "account_id",
   accountName: "account_name",
   // Requesting account_status makes Windsor ALSO return accounts that are
-  // disabled / have no activity, so a second ad account is never invisible.
+  // disabled / have no activity, so an inactive account is never invisible.
   accountStatus: "account_status",
   campaignEffectiveStatus: "campaign_effective_status",
   campaignConfiguredStatus: "campaign_configured_status",
@@ -65,7 +57,7 @@ export const WINDSOR_FIELDS = {
 
 const REQUESTED_FIELDS = Object.values(WINDSOR_FIELDS).join(",");
 
-export type WindsorConnectionId = "viora-windsor" | "trendora-windsor";
+export type WindsorConnectionId = "viora-windsor";
 
 type ConnectionConfig = {
   id: WindsorConnectionId;
@@ -76,7 +68,7 @@ type ConnectionConfig = {
 };
 
 /**
- * Exactly two configured connections - no connection-management system.
+ * Exactly one configured connection - no connection-management system.
  * `WINDSOR_API_KEY` is kept as a fallback for the Viora key so an existing
  * environment keeps working while it is renamed to WINDSOR_VIORA_API_KEY.
  */
@@ -86,12 +78,6 @@ const CONNECTIONS: ConnectionConfig[] = [
     store: "viora",
     label: "Viora Windsor",
     envKeys: ["WINDSOR_VIORA_API_KEY", "WINDSOR_API_KEY"],
-  },
-  {
-    id: "trendora-windsor",
-    store: "trendora",
-    label: "Trendora Windsor",
-    envKeys: ["WINDSOR_TRENDORA_API_KEY"],
   },
 ];
 

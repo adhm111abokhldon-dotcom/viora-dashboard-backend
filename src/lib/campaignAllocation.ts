@@ -12,10 +12,10 @@ import { round2 } from "./money.js";
  *
  * Rounding: money is split in CENTS so the shares always reconcile EXACTLY
  * to the campaign spend - no cent is ever lost or created. The remainder
- * cents go to the LAST entries of the sorted list (deterministic, and the
+ * cents go to the FIRST entries of the sorted list (deterministic, and the
  * same order every caller uses: sorted product ids).
  *
- *   $100 over 3 -> [33.33, 33.33, 33.34]  (sum = 100.00 exactly)
+ *   $100 over 3 -> [33.34, 33.33, 33.33]  (sum = 100.00 exactly)
  */
 
 /**
@@ -33,9 +33,8 @@ export function allocateEvenly(total: number, count: number): number[] {
   const remainder = totalCents - baseCents * count;
 
   return Array.from({ length: count }, (_, index) => {
-    // The last `remainder` entries each carry one extra cent.
-    const cents =
-      index >= count - remainder ? baseCents + 1 : baseCents;
+    // The first `remainder` entries each carry one extra cent.
+    const cents = index < remainder ? baseCents + 1 : baseCents;
 
     return cents / 100;
   });

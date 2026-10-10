@@ -29,6 +29,7 @@ import {
   dayKeyFormatter,
 } from "../lib/date.js";
 import { round2 } from "../lib/money.js";
+import { grandAdvertisingTotal } from "../lib/advertisingTotals.js";
 import {
   getProductTotalsFrom,
   startOfWindowForRange,
@@ -168,7 +169,7 @@ router.get("/campaigns", async (req, res) => {
   try {
     const match: Record<string, unknown> = {
       source: "windsor",
-      store: { $in: ["viora", "trendora"] },
+      store: "viora",
       campaign: { $type: "string", $ne: "" },
       ...excludeUnmappedWindsorAccountsFilter(),
     };
@@ -204,14 +205,6 @@ router.get("/campaigns", async (req, res) => {
             allocatedSpend: {
               $sum: { $ifNull: ["$allocationSnapshot.allocatedSpend", 0] },
             },
-            unallocatedSpend: {
-              $sum: {
-                $ifNull: [
-                  "$allocationSnapshot.unallocatedSpend",
-                  "$amount",
-                ],
-              },
-            },
             messages: { $sum: { $ifNull: ["$messages", 0] } },
             clicks: { $sum: { $ifNull: ["$clicks", 0] } },
             platform: { $first: "$platform" },
@@ -244,32 +237,31 @@ router.get("/campaigns", async (req, res) => {
           },
         },
       ]),
-      WindsorSyncState.find().lean(),
+      WindsorSyncState.find({ connectionId: "viora-windsor" }).lean(),
     ]);
 
-    const lastSyncByStore = new Map(
-      syncStates.map((state) => [
-        state.connectionId === "viora-windsor" ? "viora" : "trendora",
-        state.lastSuccessfulSyncAt,
-      ]),
-    );
+    const lastSuccessfulSyncAt = syncStates[0]?.lastSuccessfulSyncAt;
     const allCampaigns = groupedRows.flatMap((row) => {
       const { store, accountId, campaign } = row._id;
       if (
-        (store !== "viora" && store !== "trendora") ||
+        store !== "viora" ||
         !accountId ||
         !isKnownBusinessAccount(store, accountId)
       ) {
         return [];
       }
       const key = campaignKeyFor(store, accountId, campaign);
-      const lastSync = lastSyncByStore.get(store);
       const lastSeenAt = row.lastSeenAt ?? null;
-      const providerState = getCampaignProviderState(lastSeenAt, lastSync);
+      const providerState = getCampaignProviderState(
+        lastSeenAt,
+        lastSuccessfulSyncAt,
+      );
       const catalogState = getCampaignCatalogState(
         row.campaignEffectiveStatus,
         providerState,
       );
+      const spend = round2(row.spend);
+      const allocatedSpend = round2(row.allocatedSpend);
       return [
         {
           key,
@@ -286,9 +278,9 @@ router.get("/campaigns", async (req, res) => {
           firstActivity: row.firstActivity ?? null,
           lastActivity: row.lastActivity ?? null,
           lastSeenAt,
-          spend: round2(row.spend),
-          allocatedSpend: round2(row.allocatedSpend),
-          unallocatedSpend: round2(row.unallocatedSpend),
+          spend,
+          allocatedSpend,
+          unallocatedSpend: round2(spend - allocatedSpend),
           messages: row.messages,
           clicks: row.clicks,
           costPerMessage: roundedRatio(row.spend, row.messages),
@@ -385,7 +377,6 @@ router.get("/campaigns/:key/products", async (req, res) => {
       AdvertisingExpense.aggregate<{
         spend: number;
         allocatedSpend: number;
-        unallocatedSpend: number;
         messages: number;
         clicks: number;
         platform: string;
@@ -449,8 +440,7 @@ router.get("/campaigns/:key/products", async (req, res) => {
         .sort({ _id: 1 })
         .lean(),
       WindsorSyncState.findOne({
-        connectionId:
-          campaignRef.store === "viora" ? "viora-windsor" : "trendora-windsor",
+        connectionId: "viora-windsor",
       }).lean(),
     ]);
 
@@ -504,6 +494,8 @@ router.get("/campaigns/:key/products", async (req, res) => {
       spend?.campaignEffectiveStatus,
       providerState,
     );
+    const campaignSpend = round2(spend?.spend ?? 0);
+    const allocatedSpend = round2(spend?.allocatedSpend ?? 0);
     const totalPages = Math.ceil(totalProducts / limit);
     return res.status(200).json({
       campaign: {
@@ -522,9 +514,9 @@ router.get("/campaigns/:key/products", async (req, res) => {
         firstActivity: spend?.firstActivity ?? null,
         lastActivity: spend?.lastActivity ?? null,
         lastSeenAt: spend?.lastSeenAt ?? null,
-        spend: round2(spend?.spend ?? 0),
-        allocatedSpend: round2(spend?.allocatedSpend ?? 0),
-        unallocatedSpend: round2(spend?.unallocatedSpend ?? 0),
+        spend: campaignSpend,
+        allocatedSpend,
+        unallocatedSpend: round2(campaignSpend - allocatedSpend),
         messages: spend?.messages ?? 0,
         clicks: spend?.clicks ?? 0,
         costPerMessage: roundedRatio(spend?.spend ?? 0, spend?.messages ?? 0),
@@ -661,8 +653,8 @@ router.get("/", async (req, res) => {
     const store =
       typeof req.query.store === "string" ? req.query.store.trim() : "";
 
-    if (store === "viora" || store === "trendora") {
-      filter.store = store;
+    if (store === "viora") {
+      filter.store = "viora";
     } else if (store) {
       return badRequest(res, "Invalid store filter");
     }
@@ -1096,8 +1088,8 @@ router.post("/windsor/preview", async (_req, res) => {
  *
  *     windsor | store | ad-account | date | campaign
  *
- * so the two Trendora ad accounts stay separate, and re-running the sync
- * updates those same documents instead of creating duplicates.
+ * Re-running the sync updates those same documents instead of creating
+ * duplicates.
  *
  * MANUAL rows are never touched: every query pins `source: "windsor"`.
  */
@@ -1345,9 +1337,7 @@ function roundedRatio(numerator: number, denominator: number): number | null {
  *  - `grandTotal` : Windsor spend (USD, every ad account) + ALL manual
  *                   expenses. Accounts and manual never overlap, so nothing
  *                   is counted twice.
- *  - `accounts`   : Viora / Trendora — Facebook / Trendora — Instagram with
- *                   their own totals and campaign counts, resolved through
- *                   the business-account directory (adAccounts.ts).
+ *  - `accounts`   : the verified Viora advertising account.
  *  - `manual`     : manual expenses broken out on their own.
  *
  * Reports does NOT depend on this endpoint - it runs its own aggregation.
@@ -1368,6 +1358,9 @@ router.get("/insights", async (_req, res) => {
           $group: {
             _id: { store: "$store", accountId: "$accountId" },
             spend: { $sum: "$amount" },
+            allocatedSpend: {
+              $sum: { $ifNull: ["$allocationSnapshot.allocatedSpend", 0] },
+            },
             messages: { $sum: { $ifNull: ["$messages", 0] } },
             clicks: { $sum: { $ifNull: ["$clicks", 0] } },
           },
@@ -1405,11 +1398,12 @@ router.get("/insights", async (_req, res) => {
         { $match: { source: { $in: [null, "manual"] } } },
         { $group: { _id: null, spend: { $sum: "$amount" }, count: { $sum: 1 } } },
       ]),
-      WindsorSyncState.find().lean(),
+      WindsorSyncState.find({ connectionId: "viora-windsor" }).lean(),
     ]);
 
     type Bucket = {
       spend: number;
+      allocatedSpend: number;
       messages: number;
       clicks: number;
       campaignCount: number;
@@ -1418,6 +1412,7 @@ router.get("/insights", async (_req, res) => {
 
     const emptyBucket = (): Bucket => ({
       spend: 0,
+      allocatedSpend: 0,
       messages: 0,
       clicks: 0,
       campaignCount: 0,
@@ -1425,9 +1420,9 @@ router.get("/insights", async (_req, res) => {
     });
 
     /*
-     * The three business accounts always exist - even at zero - so every card
-     * renders without special cases; the fallback bucket joins in only when
-     * an unmapped ad account actually holds data.
+     * The Viora account always exists in the buckets - even at zero - so the
+     * card renders without a special case; the fallback bucket joins in only
+     * when an unmapped ad account actually holds data.
      */
     const buckets = new Map<BusinessAccountKey, Bucket>(
       BUSINESS_ACCOUNT_KEYS.map(
@@ -1454,16 +1449,13 @@ router.get("/insights", async (_req, res) => {
     type AccountAggRow = {
       _id: { store: string | null; accountId: string | null };
       spend: number;
+      allocatedSpend: number;
       messages: number;
       clicks: number;
     };
 
     type CampaignAggRow = {
-      _id: {
-        store: "viora" | "trendora" | null;
-        accountId: string | null;
-        campaign: string;
-      };
+      _id: { store: "viora" | null; accountId: string | null; campaign: string };
       campaignEffectiveStatus?: string | null;
       lastSeenAt?: Date | null;
     };
@@ -1473,25 +1465,21 @@ router.get("/insights", async (_req, res) => {
       if (!bucket) continue;
 
       bucket.spend += row.spend;
+      bucket.allocatedSpend += row.allocatedSpend ?? 0;
       bucket.messages += row.messages ?? 0;
       bucket.clicks += row.clicks ?? 0;
     }
 
-    const lastSyncByStore = new Map(
-      syncStates.map((state) => [
-        state.connectionId === "viora-windsor" ? "viora" : "trendora",
-        state.lastSuccessfulSyncAt,
-      ]),
-    );
+    const lastSuccessfulSyncAt = syncStates[0]?.lastSuccessfulSyncAt;
 
     for (const row of campaignAgg as CampaignAggRow[]) {
       const bucket = bucketFor(row._id.store, row._id.accountId);
       if (!bucket) continue;
       const providerState =
-        row._id.store === "viora" || row._id.store === "trendora"
+        row._id.store === "viora"
           ? getCampaignProviderState(
               row.lastSeenAt,
-              lastSyncByStore.get(row._id.store),
+              lastSuccessfulSyncAt,
             )
           : "unknown";
       const catalogState = getCampaignCatalogState(
@@ -1510,6 +1498,8 @@ router.get("/insights", async (_req, res) => {
           key,
           configured: isBusinessAccountConfigured(key),
           spend: round2(bucket.spend),
+          allocatedSpend: round2(bucket.allocatedSpend),
+          unallocatedSpend: round2(bucket.spend - bucket.allocatedSpend),
           messages: Math.round(bucket.messages),
           clicks: Math.round(bucket.clicks),
           costPerMessage: roundedRatio(bucket.spend, bucket.messages),
@@ -1532,7 +1522,7 @@ router.get("/insights", async (_req, res) => {
     );
 
     return res.status(200).json({
-      grandTotal: round2(windsorSpend + manualSpend),
+      grandTotal: grandAdvertisingTotal(windsorSpend, manualSpend),
       manual: { spend: manualSpend, count: manualAgg[0]?.count ?? 0 },
       accounts,
     });

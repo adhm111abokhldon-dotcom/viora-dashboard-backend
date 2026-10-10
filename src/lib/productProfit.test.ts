@@ -26,7 +26,7 @@ import AdvertisingExpense from "../models/AdvertisingExpense.js";
 test("campaign allocation reconciles exact cents for one, two, and three products", () => {
   assert.deepEqual(allocateEvenly(100, 1), [100]);
   assert.deepEqual(allocateEvenly(100, 2), [50, 50]);
-  assert.deepEqual(allocateEvenly(100, 3), [33.33, 33.33, 33.34]);
+  assert.deepEqual(allocateEvenly(100, 3), [33.34, 33.33, 33.33]);
   assert.equal(allocateEvenly(100, 0).length, 0);
   assert.equal(
     allocateEvenly(100, 3).reduce((sum, amount) => sum + amount, 0),
@@ -55,7 +55,7 @@ test("campaign allocation snapshots reconcile and leave unlinked spend unallocat
     { productId: "1", productName: "One" },
   ]);
   assert.deepEqual(three.products.map((product) => product.amount), [
-    33.33, 33.33, 33.34,
+    33.34, 33.33, 33.33,
   ]);
   assert.equal(
     three.products.reduce((sum, product) => sum + product.amount, 0),
@@ -122,6 +122,53 @@ test("historical snapshots retain the campaign's product set and names", () => {
   assert.equal(january.capturedAt, capturedAt);
 });
 
+test("link and unlink changes affect new snapshots without rewriting history", () => {
+  const beforeLink = createCampaignAllocationSnapshot(100, []);
+  const afterFirstLink = createCampaignAllocationSnapshot(100, [
+    { productId: "p1", productName: "Product 1" },
+  ]);
+  const afterSecondLink = createCampaignAllocationSnapshot(100, [
+    { productId: "p1", productName: "Product 1" },
+    { productId: "p2", productName: "Product 2" },
+  ]);
+  const afterUnlink = createCampaignAllocationSnapshot(100, [
+    { productId: "p2", productName: "Product 2" },
+  ]);
+  const afterAllUnlinked = createCampaignAllocationSnapshot(100, []);
+
+  assert.equal(beforeLink.allocatedSpend, 0);
+  assert.equal(beforeLink.unallocatedSpend, 100);
+  assert.deepEqual(afterFirstLink.products.map((product) => product.amount), [
+    100,
+  ]);
+  assert.deepEqual(afterSecondLink.products.map((product) => product.amount), [
+    50, 50,
+  ]);
+  assert.deepEqual(afterUnlink.products.map((product) => product.amount), [
+    100,
+  ]);
+  assert.equal(afterAllUnlinked.allocatedSpend, 0);
+  assert.equal(afterAllUnlinked.unallocatedSpend, 100);
+
+  assert.equal(beforeLink.products.length, 0);
+  assert.equal(beforeLink.allocatedSpend + beforeLink.unallocatedSpend, 100);
+  for (const snapshot of [
+    afterFirstLink,
+    afterSecondLink,
+    afterUnlink,
+    afterAllUnlinked,
+  ]) {
+    assert.equal(
+      snapshot.products.reduce((sum, product) => sum + product.amount, 0),
+      snapshot.allocatedSpend,
+    );
+    assert.equal(
+      snapshot.campaignSpend,
+      snapshot.allocatedSpend + snapshot.unallocatedSpend,
+    );
+  }
+});
+
 test("provider spend corrections preserve snapshot membership and exact cents", () => {
   const original = createCampaignAllocationSnapshot(100, [
     { productId: "p1", productName: "One" },
@@ -132,7 +179,7 @@ test("provider spend corrections preserve snapshot membership and exact cents", 
 
   assert.deepEqual(
     corrected.products.map((product) => product.amount),
-    [33.33, 33.34, 33.34],
+    [33.34, 33.34, 33.33],
   );
   assert.equal(
     corrected.products.reduce((sum, product) => sum + product.amount, 0),
@@ -186,26 +233,26 @@ test("product profitability handles profit, loss, break-even, and no-sales state
 });
 
 test("campaign identities remain distinct and safely parse delimiters in names", () => {
-  const key = campaignKeyFor("trendora", "account-2", "October | Beauty");
+  const key = campaignKeyFor("viora", "account-2", "October | Beauty");
   assert.deepEqual(parseCampaignKey(key), {
-    store: "trendora",
+    store: "viora",
     accountId: "account-2",
     campaign: "October | Beauty",
   });
 
   test("campaign identities survive Arabic and URL-sensitive campaign names", () => {
     const campaign = "عرض / خصم?10% #1 | Winter";
-    const key = campaignKeyFor("trendora", "account-2", campaign);
+    const key = campaignKeyFor("viora", "account-2", campaign);
     assert.deepEqual(parseCampaignKey(key), {
-      store: "trendora",
+      store: "viora",
       accountId: "account-2",
       campaign,
     });
     assert.equal(decodeURIComponent(encodeURIComponent(key)), key);
   });
-  assert.notEqual(
-    campaignKeyFor("viora", "account-2", "October | Beauty"),
-    key,
+  assert.equal(
+    parseCampaignKey("other|account-2|October | Beauty"),
+    null,
   );
 });
 
@@ -264,18 +311,14 @@ test("campaign catalog exposes active, paused, completed, deleted and unverified
   });
 });
 
-test("account resolution maps only explicitly configured accounts", () => {
+test("account resolution exposes only the verified Viora account", () => {
   assert.equal(resolveBusinessAccount("viora", "1825291261966849"), "viora");
   assert.equal(
-    resolveBusinessAccount("trendora", "4405257269697508"),
-    "trendora_facebook",
-  );
-  assert.equal(
-    resolveBusinessAccount("trendora", "unmapped-account"),
+    resolveBusinessAccount("viora", "unmapped-account"),
     null,
   );
   assert.equal(
-    isKnownBusinessAccount("trendora", "unmapped-account"),
+    isKnownBusinessAccount("other", "1825291261966849"),
     false,
   );
 });
@@ -319,9 +362,17 @@ test("campaign relationship schemas derive stable keys and reject unmapped accou
 
   assert.equal(
     campaignLinkSchema.safeParse({
-      store: "trendora",
+      store: "viora",
       accountId: "unmapped-account",
       campaign: "Unmapped account",
+    }).success,
+    false,
+  );
+  assert.equal(
+    campaignLinkSchema.safeParse({
+      store: "other",
+      accountId: "1825291261966849",
+      campaign: "Invalid store",
     }).success,
     false,
   );

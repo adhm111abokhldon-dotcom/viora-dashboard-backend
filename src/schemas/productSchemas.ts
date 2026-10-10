@@ -15,7 +15,7 @@ import {
  */
 export const campaignRefSchema = z
   .object({
-    store: z.enum(["viora", "trendora"]),
+    store: z.literal("viora"),
     accountId: z.string().trim().min(1, "Campaign account is required"),
     campaign: z.string().trim().min(1, "Campaign name is required"),
   })

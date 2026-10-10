@@ -62,7 +62,7 @@ export interface IAdvertisingExpense extends Document {
   originalCurrency?: string;
 
   /** Which store this advertising belongs to. Windsor rows only. */
-  store?: "viora" | "trendora";
+  store?: "viora";
 
   /** Which Windsor connection produced the row. */
   connectionId?: string;
@@ -131,7 +131,7 @@ const advertisingExpenseSchema = new Schema<IAdvertisingExpense>(
     clicks: { type: Number, min: 0 },
     originalAmount: { type: Number, min: 0 },
     originalCurrency: { type: String, trim: true },
-    store: { type: String, enum: ["viora", "trendora"] },
+    store: { type: String, enum: ["viora"] },
     connectionId: { type: String, trim: true },
     accountId: { type: String, trim: true },
     accountName: { type: String, trim: true },

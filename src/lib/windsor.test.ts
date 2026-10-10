@@ -7,10 +7,10 @@ import {
 
 function makeRow(overrides: Partial<WindsorRow> = {}): WindsorRow {
   return {
-    store: "trendora",
-    connectionId: "trendora-windsor",
-    accountId: "account-1",
-    accountName: "Trendora",
+    store: "viora",
+    connectionId: "viora-windsor",
+    accountId: "1825291261966849",
+    accountName: "Viora",
     accountStatus: "ACTIVE",
     campaignEffectiveStatus: "ACTIVE",
     campaignConfiguredStatus: "ACTIVE",

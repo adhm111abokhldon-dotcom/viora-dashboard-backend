@@ -92,14 +92,16 @@ router.get("/", async (_req, res) => {
         $group: {
           _id: "$status",
           orders: { $sum: 1 },
+          // ONE completed-sales definition (shared with /api/reports):
+          // only Delivered orders contribute revenue and profit.
           sales: {
             $sum: {
-              $cond: [{ $ne: ["$status", "Cancelled"] }, "$total", 0],
+              $cond: [{ $eq: ["$status", "Delivered"] }, "$total", 0],
             },
           },
           profit: {
             $sum: {
-              $cond: [{ $ne: ["$status", "Cancelled"] }, "$profit", 0],
+              $cond: [{ $eq: ["$status", "Delivered"] }, "$profit", 0],
             },
           },
         },
@@ -118,7 +120,8 @@ router.get("/", async (_req, res) => {
         windowStages(startOfYesterday, startOfToday),
       ),
       Order.aggregate<DailyRow>([
-        { $match: { createdAt: { $gte: startOfSalesWindow }, status: { $ne: "Cancelled" } } },
+        // 7-day sales chart: Delivered-only, same definition as reports.
+        { $match: { createdAt: { $gte: startOfSalesWindow }, status: "Delivered" } },
         {
           $group: {
             _id: {
@@ -138,15 +141,16 @@ router.get("/", async (_req, res) => {
       Order.find().sort({ createdAt: -1 }).limit(10),
     ]);
 
-    const summarizeWindow = (rows: WindowRow[]) => {
-      const active = rows.filter((row) => row._id !== "Cancelled");
-      return {
-        sales: active.reduce((sum, row) => sum + row.sales, 0),
-        profit: active.reduce((sum, row) => sum + row.profit, 0),
-        orders: active.reduce((sum, row) => sum + row.orders, 0),
-        pending: rows.find((row) => row._id === "Pending")?.orders ?? 0,
-      };
-    };
+    const summarizeWindow = (rows: WindowRow[]) => ({
+      // Completed sales: Delivered rows only (Pending/Cancelled rows are 0
+      // by the $cond above, so summing every row is already Delivered-only).
+      sales: rows.reduce((sum, row) => sum + row.sales, 0),
+      profit: rows.reduce((sum, row) => sum + row.profit, 0),
+      // Operational order count: every order created in the window, matching
+      // the all-status definition of "order count" used by reports.
+      orders: rows.reduce((sum, row) => sum + row.orders, 0),
+      pending: rows.find((row) => row._id === "Pending")?.orders ?? 0,
+    });
     const today = summarizeWindow(todayRows);
     const yesterday = summarizeWindow(yesterdayRows);
     const salesByDate = new Map(salesRows.map((row) => [row._id, row.sales]));

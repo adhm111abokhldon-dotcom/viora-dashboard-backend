@@ -13,6 +13,7 @@ import Order, {
 import Product from "../models/Product.js";
 import { calcOrder } from "../lib/calcOrder.js";
 import { nextOrderNumber } from "../lib/orderNumber.js";
+import { resolveStatusTransition } from "../lib/orderLifecycle.js";
 
 const router = Router();
 
@@ -246,8 +247,9 @@ router.get("/", async (req, res) => {
        * Stats are calculated from all matching orders,
        * not only the current page.
        *
-       * Cancelled orders are excluded from revenue/profit
-       * because they are not completed sales.
+       * Revenue and profit follow the ONE completed-sales definition used by
+       * reports, dashboard and product stats: only Delivered orders count.
+       * Pending and Cancelled orders contribute nothing to revenue/profit.
        */
       Order.aggregate([
         { $match: filter },
@@ -272,13 +274,13 @@ router.get("/", async (req, res) => {
 
             revenue: {
               $sum: {
-                $cond: [{ $ne: ["$status", "Cancelled"] }, "$total", 0],
+                $cond: [{ $eq: ["$status", "Delivered"] }, "$total", 0],
               },
             },
 
             profit: {
               $sum: {
-                $cond: [{ $ne: ["$status", "Cancelled"] }, "$profit", 0],
+                $cond: [{ $eq: ["$status", "Delivered"] }, "$profit", 0],
               },
             },
           },
@@ -518,19 +520,14 @@ router.delete("/:id", async (req, res) => {
       }
 
       /*
-       * Pending:
-       * المخزون لسا محجوز → رجّعه.
+       * DELETE is an administrative/database operation - it NEVER touches
+       * inventory, regardless of status (DELETE ≠ CANCEL is a hard rule):
        *
-       * Delivered:
-       * البضاعة طلعت → لا ترجع stock.
-       *
-       * Cancelled:
-       * المخزون رجع وقت الإلغاء → لا ترجعه مرة ثانية.
+       * Pending:  the reservation stays consumed; CANCEL (before deleting) is
+       *           the only operation that restores stock for a pending order.
+       * Delivered: the goods already left - nothing to restore.
+       * Cancelled: stock was already restored when the order was cancelled.
        */
-      if (order.status === "Pending") {
-        await releaseStock(order.items, session);
-      }
-
       await Order.deleteOne({ _id: order._id }, { session });
     });
 
@@ -572,32 +569,18 @@ router.patch("/:id/status", async (req, res) => {
         throw new OrderError("Order not found", 404);
       }
 
-      if (order.status === newStatus) {
-        throw new OrderError("Order already has this status");
+      const transition = resolveStatusTransition(order.status, newStatus);
+
+      if (!transition.allowed) {
+        throw new OrderError(transition.reason);
       }
 
-      if (order.status === "Pending" && newStatus === "Delivered") {
-        order.status = "Delivered";
-      }
-
-  
-      else if (order.status === "Pending" && newStatus === "Cancelled") {
+      if (transition.releaseStock) {
+        // Pending -> Cancelled and Delivered -> Cancelled RESTORE the stock.
         await releaseStock(order.items, session);
-
-        order.status = "Cancelled";
       }
 
-  
-      else if (order.status === "Delivered" && newStatus === "Cancelled") {
-        order.status = "Cancelled";
-      }
-
-      else {
-        throw new OrderError(
-          `Cannot change order status from ${order.status} to ${newStatus}`,
-        );
-      }
-
+      order.status = transition.next;
       await order.save({ session });
 
       return order;

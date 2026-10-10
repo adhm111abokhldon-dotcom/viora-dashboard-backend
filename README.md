@@ -7,9 +7,8 @@ connector keys. In production, set `FRONTEND_URL` to one or more
 comma-separated HTTPS origins used by the dashboard. The dashboard login is a
 frontend-only navigation gate and does not authenticate or authorize API
 requests. Protect the API and database using deployment/network controls.
-Set `WINDSOR_TRENDORA_INSTAGRAM_ACCOUNT_ID` only after verifying that account
-ID in Windsor; unknown Windsor accounts are excluded rather than assigned to
-another business account.
+Advertising data is limited to Viora's verified Windsor account; unknown
+Windsor accounts are excluded rather than assigned to Viora.
 
 ## Business-number reset migration
 
@@ -47,9 +46,11 @@ and product profitability resolve those references against Windsor advertising
 rows. Campaign spend remains unchanged; product allocation is an estimate,
 not product-level attribution. Each Windsor campaign-day expense stores an
 exact-cent allocation snapshot with the product IDs and names that were linked
-when that spend was captured. Changing links affects future spend only;
-historical allocations remain unchanged, including when a product is renamed
-or deleted. Campaign spend with no linked products remains unallocated.
+when that spend was captured. New spend follows current links; existing
+snapshots remain unchanged, including when a product is renamed or deleted.
+Unsnapshotted spend is captured against persisted links: additions are captured
+after they are saved, while removals preserve the prior links by capturing
+before the change. Campaign spend with no linked products remains unallocated.
 Product revenue and sold-unit cost use the order-item snapshots, while delivery
 cost follows the existing order allocation rule.
 

@@ -1,58 +1,17 @@
-export type StoreId = "viora" | "trendora";
+export type StoreId = "viora";
+export type BusinessAccountKey = "viora";
 
-export type BusinessAccountKey =
-  | "viora"
-  | "trendora_facebook"
-  | "trendora_instagram";
+export const BUSINESS_ACCOUNT_KEYS = ["viora"] as const;
 
-export const BUSINESS_ACCOUNT_KEYS = [
-  "viora",
-  "trendora_facebook",
-  "trendora_instagram",
-] as const satisfies readonly BusinessAccountKey[];
-
-type DirectoryEntry = {
-  store: StoreId;
-  account: BusinessAccountKey;
-};
-
-let directory: Record<string, DirectoryEntry> | undefined;
-
-function getAccountDirectory(): Record<string, DirectoryEntry> {
-  if (directory) return directory;
-
-  directory = {
-    "1825291261966849": { store: "viora", account: "viora" },
-    "4405257269697508": { store: "trendora", account: "trendora_facebook" },
-  };
-
-  const instagramAccountId =
-    process.env.WINDSOR_TRENDORA_INSTAGRAM_ACCOUNT_ID?.trim();
-  if (instagramAccountId) {
-    if (directory[instagramAccountId]) {
-      throw new Error(
-        "WINDSOR_TRENDORA_INSTAGRAM_ACCOUNT_ID duplicates a mapped advertising account",
-      );
-    }
-
-    directory[instagramAccountId] = {
-      store: "trendora",
-      account: "trendora_instagram",
-    };
-  }
-
-  return directory;
-}
+const VIORA_AD_ACCOUNT_ID = "1825291261966849";
 
 export function resolveBusinessAccount(
   store: string | null | undefined,
   accountId: string | null | undefined,
 ): BusinessAccountKey | null {
-  const id = (accountId ?? "").trim();
-  if (!id) return null;
-
-  const entry = getAccountDirectory()[id];
-  return entry && entry.store === store ? entry.account : null;
+  return store === "viora" && accountId?.trim() === VIORA_AD_ACCOUNT_ID
+    ? "viora"
+    : null;
 }
 
 export function isKnownBusinessAccount(
@@ -65,25 +24,22 @@ export function isKnownBusinessAccount(
 export function isBusinessAccountConfigured(
   key: BusinessAccountKey,
 ): boolean {
-  return Object.values(getAccountDirectory()).some(
-    (entry) => entry.account === key,
-  );
+  return key === "viora";
 }
 
 export function isAccountKey(value: string): value is BusinessAccountKey {
-  return (BUSINESS_ACCOUNT_KEYS as readonly string[]).includes(value);
+  return value === "viora";
 }
 
-/**
- * Keep manual expenses while excluding every Windsor account not explicitly
- * mapped above. Unknown accounts must never fall into another store's totals.
- */
 export function excludeUnmappedWindsorAccountsFilter(): Record<string, unknown> {
   return {
     $nor: [
       {
         source: "windsor",
-        accountId: { $nin: Object.keys(getAccountDirectory()) },
+        $or: [
+          { store: { $ne: "viora" } },
+          { accountId: { $ne: VIORA_AD_ACCOUNT_ID } },
+        ],
       },
     ],
   };
@@ -92,21 +48,14 @@ export function excludeUnmappedWindsorAccountsFilter(): Record<string, unknown> 
 export function accountFilter(
   key: BusinessAccountKey,
 ): Record<string, unknown> {
-  const accountIds = Object.entries(getAccountDirectory())
-    .filter(([, entry]) => entry.account === key)
-    .map(([accountId]) => accountId);
-
   return {
     source: "windsor",
-    accountId: { $in: accountIds },
+    store: "viora",
+    accountId: key === "viora" ? VIORA_AD_ACCOUNT_ID : "",
   };
 }
 
-/* -------------------------------------------------------------------------- */
-/* Campaign identity                                                          */
-/* -------------------------------------------------------------------------- */
-
-/** Stable identity prevents same-named campaigns in different accounts colliding. */
+/** Stable identity keeps campaign names opaque after the fixed account prefix. */
 export function campaignKeyFor(
   store: StoreId,
   accountId: string,
@@ -115,7 +64,6 @@ export function campaignKeyFor(
   return [store, accountId || "unknown", campaign].join("|");
 }
 
-/** Parse the two fixed identity separators; the campaign remainder is opaque. */
 export function parseCampaignKey(
   key: string,
 ): { store: StoreId; accountId: string; campaign: string } | null {
@@ -125,8 +73,7 @@ export function parseCampaignKey(
 
   const store = key.slice(0, firstSeparator);
   const accountId = key.slice(firstSeparator + 1, secondSeparator);
-  if (store !== "viora" && store !== "trendora") return null;
-  if (!accountId) return null;
+  if (store !== "viora" || !accountId) return null;
 
   const campaign = key.slice(secondSeparator + 1);
   if (!campaign) return null;
