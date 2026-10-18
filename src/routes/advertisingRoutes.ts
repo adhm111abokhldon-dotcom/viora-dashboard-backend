@@ -29,6 +29,7 @@ import {
   dayKeyFormatter,
 } from "../lib/date.js";
 import { round2 } from "../lib/money.js";
+import { calcOrderFinancials } from "../lib/calcOrder.js";
 import { grandAdvertisingTotal } from "../lib/advertisingTotals.js";
 import {
   getProductTotalsFrom,
@@ -39,6 +40,7 @@ import {
   BUSINESS_ACCOUNT_KEYS,
   accountFilter,
   campaignKeyFor,
+  campaignKeyVariants,
   excludeUnmappedWindsorAccountsFilter,
   isBusinessAccountConfigured,
   isAccountKey,
@@ -177,7 +179,12 @@ router.get("/campaigns", async (req, res) => {
     }
     const [groupedRows, syncStates] = await Promise.all([
       AdvertisingExpense.aggregate<{
-        _id: { store?: string; accountId?: string; campaign: string };
+        _id: {
+          store?: string;
+          accountId?: string;
+          campaign: string;
+          campaignId?: string | null;
+        };
         spend: number;
         messages: number;
         clicks: number;
@@ -197,6 +204,7 @@ router.get("/campaigns", async (req, res) => {
               store: "$store",
               accountId: "$accountId",
               campaign: "$campaign",
+              campaignId: "$campaignId",
             },
             spend: { $sum: "$amount" },
             messages: { $sum: { $ifNull: ["$messages", 0] } },
@@ -236,7 +244,7 @@ router.get("/campaigns", async (req, res) => {
 
     const lastSuccessfulSyncAt = syncStates[0]?.lastSuccessfulSyncAt;
     const allCampaigns = groupedRows.flatMap((row) => {
-      const { store, accountId, campaign } = row._id;
+      const { store, accountId, campaign, campaignId } = row._id;
       if (
         store !== "viora" ||
         !accountId ||
@@ -244,7 +252,7 @@ router.get("/campaigns", async (req, res) => {
       ) {
         return [];
       }
-      const key = campaignKeyFor(store, accountId, campaign);
+      const key = campaignKeyFor(store, accountId, campaign, campaignId);
       const lastSeenAt = row.lastSeenAt ?? null;
       const providerState = getCampaignProviderState(
         lastSeenAt,
@@ -260,6 +268,7 @@ router.get("/campaigns", async (req, res) => {
           key,
           store,
           accountId,
+          campaignId: campaignId ?? null,
           campaign,
           accountKey: resolveBusinessAccount(store, accountId)!,
           accountName: row.accountName ?? accountId,
@@ -284,7 +293,9 @@ router.get("/campaigns", async (req, res) => {
     }
     const start = (page - 1) * limit;
     const pageCampaigns = allCampaigns.slice(start, start + limit);
-    const campaignKeys = pageCampaigns.map((campaign) => campaign.key);
+    const campaignKeys = pageCampaigns.flatMap((campaign) =>
+      campaignKeyVariants(campaign.key),
+    );
     const linkedCounts =
       campaignKeys.length > 0
         ? await Product.aggregate<{ _id: string; count: number }>([
@@ -333,6 +344,193 @@ router.get("/campaigns", async (req, res) => {
     console.error("Failed to fetch campaign catalog:", error);
     return res.status(500).json({ message: "Failed to fetch campaigns" });
   }
+});
+
+/**
+ * GET /api/advertising/campaigns/:key/profitability?from=YYYY-MM-DD&to=YYYY-MM-DD
+ *
+ * Attributed profitability of ONE campaign over a date window:
+ *
+ *   - spend: Windsor spend for this exact campaign+account within [from, to]
+ *   - attributed revenue/orders: delivered orders whose stored campaign key
+ *     matches this campaign, delivered within [from, to]
+ *   - ROAS = revenue / spend; margin = revenue - product cost - delivery -
+ *     spend; cost per order; AOV
+ *   - paginated list of attributed orders
+ *
+ * Windsor rows and order snapshots both carry the campaign key, so
+ * same-named campaigns never bleed into each other.
+ */
+router.get("/campaigns/:key/profitability", async (req, res) => {
+  const campaignRef = parseCampaignKey(req.params.key);
+  if (
+    !campaignRef ||
+    !isKnownBusinessAccount(campaignRef.store, campaignRef.accountId)
+  ) {
+    return res.status(404).json({ message: "Campaign not found" });
+  }
+
+  const page = Number(req.query.page ?? 1);
+  const limit = Number(req.query.limit ?? DEFAULT_LIMIT);
+  if (
+    !Number.isSafeInteger(page) ||
+    page < 1 ||
+    !Number.isSafeInteger(limit) ||
+    limit < 1 ||
+    limit > MAX_LIMIT ||
+    !Number.isSafeInteger((page - 1) * limit)
+  ) {
+    return badRequest(res, "Invalid pagination parameters");
+  }
+
+  const from = req.query.from
+    ? new Date(`${String(req.query.from)}T00:00:00.000Z`)
+    : null;
+  const to = req.query.to
+    ? new Date(`${String(req.query.to)}T00:00:00.000Z`)
+    : null;
+
+  const dateFilter: Record<string, unknown> = {};
+  if (from) dateFilter.$gte = from;
+  if (to) dateFilter.$lte = to;
+
+  const orderFilter: Record<string, unknown> = {
+    status: "Delivered",
+    "campaign.key": req.params.key,
+  };
+  if (Object.keys(dateFilter).length > 0) {
+    orderFilter.deliveredAt = dateFilter;
+  }
+
+  const skip = (page - 1) * limit;
+  const [attributedOrders, totalAttributed] = await Promise.all([
+    Order.find(orderFilter)
+      .sort({ deliveredAt: -1, _id: -1 })
+      .skip(skip)
+      .limit(limit)
+      .lean(),
+    Order.countDocuments(orderFilter),
+  ]);
+
+  const orderTotals = await Order.aggregate([
+    { $match: orderFilter },
+    {
+      $group: {
+        _id: null,
+        revenue: { $sum: "$total" },
+        productCost: {
+          $sum: {
+            $reduce: {
+              input: "$items",
+              initialValue: 0,
+              in: {
+                $add: [
+                  "$$value",
+                  {
+                    $multiply: [
+                      "$$this.quantity",
+                      { $ifNull: ["$$this.unitCost", 0] },
+                    ],
+                  },
+                ],
+              },
+            },
+          },
+        },
+        deliveryCost: { $sum: "$deliveryCost" },
+      },
+    },
+  ]);
+  const totals = orderTotals[0];
+
+  // Windsor spend for this exact campaign/account within the window. campaignId
+  // null matches rows stored without a campaign id (name-keyed legacy rows),
+  // so same-named campaigns never share spend.
+  const spendFilter: Record<string, unknown> = {
+    source: WINDSOR_SOURCE,
+    store: campaignRef.store,
+    accountId: campaignRef.accountId,
+    campaign: campaignRef.campaign,
+    campaignId: campaignRef.campaignId ?? null,
+  };
+  if (Object.keys(dateFilter).length > 0) {
+    spendFilter.date = dateFilter;
+  }
+
+  const spendRows = await AdvertisingExpense.aggregate([
+    { $match: spendFilter },
+    {
+      $group: {
+        _id: null,
+        spend: { $sum: "$amount" },
+      },
+    },
+  ]);
+
+  const spend = round2(spendRows[0]?.spend ?? 0);
+  const revenue = round2(totals?.revenue ?? 0);
+  const productCost = round2(totals?.productCost ?? 0);
+  const deliveryCost = round2(totals?.deliveryCost ?? 0);
+  const grossContribution = round2(revenue - productCost - deliveryCost);
+  const margin = round2(grossContribution - spend);
+  const orderCount = totalAttributed;
+  const roas = spend > 0 ? round2(revenue / spend) : null;
+  const costPerOrder = orderCount > 0 ? round2(spend / orderCount) : null;
+  const averageOrderValue = orderCount > 0 ? round2(revenue / orderCount) : null;
+
+  const orders = attributedOrders.map((order) => {
+    const financials = calcOrderFinancials(
+      order.items as { quantity: number; unitPrice: number; unitCost: number }[],
+      order.deliveryCharged,
+      order.deliveryCost,
+    );
+    return {
+      id: order._id,
+      orderNumber: order.orderNumber,
+      customer: order.customer,
+      phone: order.phone,
+      status: order.status,
+      deliveredAt: order.deliveredAt,
+      items: order.items,
+      deliveryCharged: order.deliveryCharged,
+      deliveryCost: order.deliveryCost,
+      total: order.total,
+      financials,
+    };
+  });
+
+  const totalPages = Math.ceil(totalAttributed / limit);
+  return res.status(200).json({
+    campaign: {
+      key: req.params.key,
+      store: campaignRef.store,
+      accountId: campaignRef.accountId,
+      campaignId: campaignRef.campaignId,
+      campaign: campaignRef.campaign,
+    },
+    window: { from: from ?? null, to: to ?? null },
+    summary: {
+      spend,
+      attributedRevenue: revenue,
+      productCost,
+      deliveryCost,
+      grossContribution,
+      margin,
+      roas,
+      costPerOrder,
+      averageOrderValue,
+      orderCount,
+    },
+    orders,
+    pagination: {
+      currentPage: page,
+      limit,
+      totalAttributed,
+      totalPages,
+      hasNextPage: page < totalPages,
+      hasPreviousPage: page > 1,
+    },
+  });
 });
 
 router.get("/campaigns/:key/products", async (req, res) => {
@@ -423,7 +621,9 @@ router.get("/campaigns/:key/products", async (req, res) => {
         .skip((page - 1) * limit)
         .limit(limit)
         .lean(),
-      Product.find({ "campaigns.key": key })
+      Product.find({
+        "campaigns.key": { $in: campaignKeyVariants(key) },
+      })
         .select("_id")
         .sort({ _id: 1 })
         .lean(),
@@ -969,11 +1169,12 @@ router.post("/windsor/preview", async (_req, res) => {
     // live under the legacy key until the sync re-keys them, so preview must
     // count them as updates rather than new rows.
     const newKeys = rows.map((r) =>
-      externalKeyFor(r.store, r.accountId, r.date, r.campaign),
+      externalKeyFor(r.store, r.accountId, r.date, r.campaign, r.campaignId),
     );
-    const legacyKeys = rows.map((r) =>
+    const legacyKeys = rows.flatMap((r) => [
       legacyExternalKeyFor(r.accountId, r.date, r.campaign),
-    );
+      externalKeyFor(r.store, r.accountId, r.date, r.campaign),
+    ]);
     const existing = await existingWindsorAmounts(newKeys, legacyKeys);
 
     let created = 0;
@@ -981,14 +1182,29 @@ router.post("/windsor/preview", async (_req, res) => {
     let unchanged = 0;
 
     const previewRows = rows.map((r) => {
-      const key = externalKeyFor(r.store, r.accountId, r.date, r.campaign);
-      const legacyKey = legacyExternalKeyFor(r.accountId, r.date, r.campaign);
+      const key = externalKeyFor(
+        r.store,
+        r.accountId,
+        r.date,
+        r.campaign,
+        r.campaignId,
+      );
+      const legacyKeysForRow = [
+        legacyExternalKeyFor(r.accountId, r.date, r.campaign),
+        externalKeyFor(r.store, r.accountId, r.date, r.campaign),
+      ];
 
       /* Mirror EXACTLY what the sync stores: round2 first, then AED -> USD,
          so "unchanged" here means the sync really will write the same
          amount. */
       const usd = aedToUsd(round2(r.spend));
-      const stored = existing.get(key) ?? existing.get(legacyKey);
+      let stored = existing.get(key);
+      if (stored === undefined) {
+        for (const legacyKey of legacyKeysForRow) {
+          stored = existing.get(legacyKey);
+          if (stored !== undefined) break;
+        }
+      }
 
       if (stored === undefined) created += 1;
       else if (stored === usd) unchanged += 1;
@@ -1042,7 +1258,7 @@ router.post("/windsor/preview", async (_req, res) => {
  * Stores the FULL available Windsor period for every configured connection.
  * Each row is keyed on
  *
- *     windsor | store | ad-account | date | campaign
+ *     windsor | store | ad-account | date | campaign [| campaign-id]
  *
  * Re-running the sync updates those same documents instead of creating
  * duplicates.
@@ -1069,32 +1285,33 @@ router.post("/windsor/sync", async (_req, res) => {
         row.accountId,
         row.date,
         row.campaign,
+        row.campaignId ?? null,
       );
 
       /*
-       * Rows synced BEFORE the store segment existed use the older key
-       * `windsor|account|date|campaign`. Left alone they sit beside the new
-       * rows and the SAME spend is counted twice.
+       * Rows synced BEFORE the store/campaign-id segments existed use older
+       * keys (`windsor|account|date|campaign` and
+       * `windsor|store|account|date|campaign`). Left alone they sit beside
+       * the new rows and the SAME spend is counted twice.
        *
        *  - new key free  -> rename the old row onto it (no data change)
        *  - new key taken -> the two rows are the same campaign-day, so the
-       *                      stale pre-store row is removed
+       *                     stale pre-segment row is removed
        *
        * Only ever affects Windsor rows this feature created; manual rows
        * have no externalKey and are never touched.
        */
-      const legacyKey = legacyExternalKeyFor(
-        row.accountId,
-        row.date,
-        row.campaign,
-      );
+      const legacyKeys = [
+        legacyExternalKeyFor(row.accountId, row.date, row.campaign),
+        externalKeyFor(row.store, row.accountId, row.date, row.campaign),
+      ];
 
-      /* Match the old key OR a row that lost its key entirely. */
+      /* Match any old key OR a row that lost its key entirely. */
       const legacyRow = await AdvertisingExpense.findOne(
         {
           source: WINDSOR_SOURCE,
           $or: [
-            { externalKey: legacyKey },
+            { externalKey: { $in: legacyKeys } },
             {
               externalKey: { $exists: false },
               accountId: row.accountId,
@@ -1160,6 +1377,7 @@ router.post("/windsor/sync", async (_req, res) => {
         accountId: row.accountId || undefined,
         accountName: row.accountName || undefined,
         accountStatus: row.accountStatus || undefined,
+        campaignId: row.campaignId || undefined,
         campaignEffectiveStatus: row.campaignEffectiveStatus,
         campaignConfiguredStatus: row.campaignConfiguredStatus,
         lastSeenAt: syncAt,
@@ -1313,6 +1531,7 @@ router.get("/insights", async (_req, res) => {
               store: "$store",
               accountId: "$accountId",
               campaign: "$campaign",
+              campaignId: "$campaignId",
             },
             spend: { $sum: "$amount" },
             campaignEffectiveStatus: { $last: "$campaignEffectiveStatus" },
@@ -1383,7 +1602,12 @@ router.get("/insights", async (_req, res) => {
     };
 
     type CampaignAggRow = {
-      _id: { store: "viora" | null; accountId: string | null; campaign: string };
+      _id: {
+        store: "viora" | null;
+        accountId: string | null;
+        campaign: string;
+        campaignId?: string | null;
+      };
       spend: number;
       campaignEffectiveStatus?: string | null;
       lastSeenAt?: Date | null;
@@ -1405,13 +1629,21 @@ router.get("/insights", async (_req, res) => {
      * spend that has at least one CURRENTLY linked product. Campaigns with no
      * linked product contribute their spend to unallocated, never to allocated.
      */
-    const campaignKeys = (campaignAgg as CampaignAggRow[])
+    const campaignKeyRows = (campaignAgg as CampaignAggRow[])
       .map((row) =>
         row._id.store && row._id.accountId
-          ? campaignKeyFor(row._id.store, row._id.accountId, row._id.campaign)
+          ? campaignKeyFor(
+              row._id.store,
+              row._id.accountId,
+              row._id.campaign,
+              row._id.campaignId,
+            )
           : null,
       )
       .filter((key): key is string => key !== null);
+    const campaignKeys = campaignKeyRows.flatMap((key) =>
+      campaignKeyVariants(key),
+    );
     const linkedCountRows =
       campaignKeys.length > 0
         ? await Product.aggregate<{ _id: string; count: number }>([
@@ -1442,9 +1674,19 @@ router.get("/insights", async (_req, res) => {
       bucket.campaignStateCounts[catalogState] += 1;
       const key =
         row._id.store && row._id.accountId
-          ? campaignKeyFor(row._id.store, row._id.accountId, row._id.campaign)
+          ? campaignKeyFor(
+              row._id.store,
+              row._id.accountId,
+              row._id.campaign,
+              row._id.campaignId,
+            )
           : null;
-      const linkedCount = key ? (linkedCountByKey.get(key) ?? 0) : 0;
+      const linkedCount = key
+        ? campaignKeyVariants(key).reduce(
+            (max, variant) => Math.max(max, linkedCountByKey.get(variant) ?? 0),
+            0,
+          )
+        : 0;
       // A campaign contributes its full spend to allocated only when it has at
       // least one CURRENTLY linked product (same rule as currentStateAllocation).
       if (linkedCount > 0) {

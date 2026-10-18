@@ -48,6 +48,8 @@ export const WINDSOR_FIELDS = {
   currency: "currency",
   accountId: "account_id",
   accountName: "account_name",
+  /** Windsor's stable id for the campaign - may be absent from responses. */
+  campaignId: "campaign_id",
   // Requesting account_status makes Windsor ALSO return accounts that are
   // disabled / have no activity, so an inactive account is never invisible.
   accountStatus: "account_status",
@@ -125,6 +127,9 @@ export type WindsorRow = {
   /** YYYY-MM-DD exactly as Windsor returned it. */
   date: string;
   campaign: string;
+  /** Windsor's stable campaign id, when Windsor returned one. Rows fetched
+   *  before this field existed are matched by campaign name instead (`null`). */
+  campaignId: string | null;
   /** Raw spend in the SOURCE currency (AED); never converted here. */
   spend: number;
   clicks: number;
@@ -182,16 +187,27 @@ export type WindsorFetchAllResult = {
  * Collapse those rows before previewing or syncing, and reject conflicting
  * populated rows rather than allowing response order to overwrite metrics.
  */
+/** Normalize a Windsor date to `YYYY-MM-DD`. Windsor returns `YYYY-MM-DD`;
+ *  accept an ISO instant too and strip the time portion so grouping never
+ *  splits one day into two keys. */
+export function normalizeWindsorDate(date: string): string {
+  const iso = date.match(/^\d{4}-\d{2}-\d{2}/);
+  return iso ? iso[0] : date;
+}
+
 export function deduplicateCampaignDayRows(rows: WindsorRow[]): WindsorRow[] {
   const groups = new Map<string, WindsorRow[]>();
 
   for (const row of rows) {
+    /* Same store/connection/account, same day, and the SAME campaign:
+     * campaign id when Windsor gives us one, otherwise the campaign name.
+     * Two different campaigns that happen to share a name stay separate. */
     const key = JSON.stringify([
       row.store,
       row.connectionId,
       row.accountId,
-      row.date,
-      row.campaign,
+      row.campaignId ? `id:${row.campaignId}` : `name:${row.campaign}`,
+      normalizeWindsorDate(row.date),
     ]);
     const group = groups.get(key) ?? [];
     group.push(row);
@@ -206,17 +222,21 @@ export function deduplicateCampaignDayRows(rows: WindsorRow[]): WindsorRow[] {
       continue;
     }
 
+    /* Rows whose metrics are all zero add nothing: an empty row collapses
+     * into a populated one without either "winning" by response order. */
     const populated = group.filter(
       (row) => row.spend !== 0 || row.clicks !== 0 || row.messages !== 0,
     );
     const candidates = populated.length > 0 ? populated : group;
+
+    /* Money metrics decide whether rows genuinely conflict. The effective
+     * and configured statuses describe the campaign, not the numbers - a
+     * status-only difference is NOT a conflict, so keep the candidate that
+     * carries the most information, deterministically whatever response
+     * order Windsor used. */
     const signatures = new Set(
       candidates.map((row) =>
         JSON.stringify([
-          row.accountName,
-          row.accountStatus,
-          row.campaignEffectiveStatus,
-          row.campaignConfiguredStatus,
           row.spend,
           row.clicks,
           row.messages,
@@ -227,14 +247,56 @@ export function deduplicateCampaignDayRows(rows: WindsorRow[]): WindsorRow[] {
     );
 
     if (signatures.size > 1) {
+      const diagnostics = candidates.map((r) => ({
+        spend: r.spend,
+        clicks: r.clicks,
+        messages: r.messages,
+        costPerMessage: r.costPerMessage,
+        currency: r.currency,
+        campaignEffectiveStatus: r.campaignEffectiveStatus,
+        campaignConfiguredStatus: r.campaignConfiguredStatus,
+      }));
       throw new WindsorError(
-        "Windsor returned conflicting rows for the same campaign and day",
+        `Windsor returned conflicting rows for campaign "${
+          group[0]!.campaign
+        }" on ${normalizeWindsorDate(group[0]!.date)}: ${JSON.stringify(
+          diagnostics,
+        )}`,
         502,
         group[0]!.connectionId,
       );
     }
 
-    deduplicated.push(candidates[0]!);
+    const ranked = [...candidates].sort((a, b) => {
+      const aStatus =
+        typeof a.campaignEffectiveStatus === "string" &&
+        a.campaignEffectiveStatus.trim().length > 0
+          ? 1
+          : 0;
+      const bStatus =
+        typeof b.campaignEffectiveStatus === "string" &&
+        b.campaignEffectiveStatus.trim().length > 0
+          ? 1
+          : 0;
+      if (bStatus !== aStatus) return bStatus - aStatus;
+      const aSig = JSON.stringify([
+        a.spend,
+        a.clicks,
+        a.messages,
+        a.costPerMessage,
+        a.currency,
+      ]);
+      const bSig = JSON.stringify([
+        b.spend,
+        b.clicks,
+        b.messages,
+        b.costPerMessage,
+        b.currency,
+      ]);
+      return aSig < bSig ? -1 : aSig > bSig ? 1 : 0;
+    });
+
+    deduplicated.push(ranked[0]!);
   }
 
   return deduplicated;
@@ -252,8 +314,19 @@ export function externalKeyFor(
   accountId: string,
   date: string,
   campaign: string,
+  campaignId?: string | null,
 ): string {
-  return ["windsor", store, accountId || UNKNOWN_ACCOUNT, date, campaign].join("|");
+  const segments: string[] = [
+    "windsor",
+    store,
+    accountId || UNKNOWN_ACCOUNT,
+    date,
+  ];
+  const safeCampaignId =
+    campaignId && campaignId.trim() ? campaignId.trim() : null;
+  if (safeCampaignId) segments.push(`cid:${safeCampaignId}`);
+  segments.push(campaign);
+  return segments.join("|");
 }
 
 /**
@@ -383,6 +456,10 @@ function normalise(
           : null,
       date,
       campaign,
+      campaignId:
+        typeof r[WINDSOR_FIELDS.campaignId] === "string"
+          ? (r[WINDSOR_FIELDS.campaignId] as string).trim() || null
+          : null,
       spend: num(r[WINDSOR_FIELDS.spend]),
       clicks: num(r[WINDSOR_FIELDS.clicks]),
       messages,

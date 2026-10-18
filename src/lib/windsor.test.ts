@@ -16,6 +16,7 @@ function makeRow(overrides: Partial<WindsorRow> = {}): WindsorRow {
     campaignConfiguredStatus: "ACTIVE",
     date: "2026-09-08",
     campaign: "Campaign",
+    campaignId: null,
     spend: 0,
     clicks: 0,
     messages: 0,
@@ -76,4 +77,14 @@ test("campaign-day deduplication rejects conflicting populated rows", () => {
     () => deduplicateCampaignDayRows([first, conflicting]),
     /conflicting rows for the same campaign and day/,
   );
+});
+
+test("campaign-day deduplication keeps a lone populated row", () => {
+  const populated = makeRow({ spend: 10, clicks: 5, messages: 2 });
+
+  assert.deepEqual(deduplicateCampaignDayRows([populated]), [populated]);
+});
+
+test("campaign-day deduplication returns an empty array for no rows", () => {
+  assert.deepEqual(deduplicateCampaignDayRows([]), []);
 });

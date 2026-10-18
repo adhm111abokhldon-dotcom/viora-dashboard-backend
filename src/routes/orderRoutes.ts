@@ -13,7 +13,12 @@ import Order, {
 import Product from "../models/Product.js";
 import { calcOrder } from "../lib/calcOrder.js";
 import { nextOrderNumber } from "../lib/orderNumber.js";
+import { computeOrderInventoryAdjustments } from "../lib/orderInventory.js";
 import { resolveStatusTransition } from "../lib/orderLifecycle.js";
+import {
+  isKnownBusinessAccount,
+  parseCampaignKey,
+} from "../lib/adAccounts.js";
 
 const router = Router();
 
@@ -148,6 +153,37 @@ async function buildLines(
 
 function hasInvalidProductId(items: InputItem[]) {
   return items.some((item) => !mongoose.isValidObjectId(item.productId));
+}
+
+/**
+ * Validate an optional campaign key sent with create/edit. Returns the
+ * campaign snapshot to store on the order, or null when no campaign is
+ * selected. A non-empty key that cannot be parsed or does not belong to the
+ * configured business account is an error.
+ */
+function resolveCampaign(
+  campaignKey: string | null | undefined,
+): {
+  key: string;
+  store: "viora";
+  accountId: string;
+  campaignId: string | null;
+  campaign: string;
+} | null {
+  if (!campaignKey) return null;
+
+  const parsed = parseCampaignKey(campaignKey);
+  if (!parsed || !isKnownBusinessAccount(parsed.store, parsed.accountId)) {
+    return null;
+  }
+
+  return {
+    key: campaignKey,
+    store: parsed.store,
+    accountId: parsed.accountId,
+    campaignId: parsed.campaignId,
+    campaign: parsed.campaign,
+  };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -367,11 +403,20 @@ router.post("/", async (req, res) => {
     });
   }
 
-  const { customer, phone, items, deliveryCharged, deliveryCost } = result.data;
+  const { customer, phone, items, deliveryCharged, deliveryCost, campaignKey } =
+    result.data;
 
   if (hasInvalidProductId(items)) {
     return res.status(400).json({
       message: "Invalid product ID",
+    });
+  }
+
+  const campaign = resolveCampaign(campaignKey);
+
+  if (!campaign && campaignKey) {
+    return res.status(400).json({
+      message: "Invalid campaign",
     });
   }
 
@@ -398,6 +443,7 @@ router.post("/", async (req, res) => {
             total,
             profit,
             status: "Pending",
+            campaign,
           },
         ],
         { session },
@@ -432,11 +478,20 @@ router.put("/:id", async (req, res) => {
     });
   }
 
-  const { customer, phone, items, deliveryCharged, deliveryCost } = result.data;
+  const { customer, phone, items, deliveryCharged, deliveryCost, campaignKey } =
+    result.data;
 
   if (hasInvalidProductId(items)) {
     return res.status(400).json({
       message: "Invalid product ID",
+    });
+  }
+
+  const campaign = resolveCampaign(campaignKey);
+
+  if (!campaign && campaignKey) {
+    return res.status(400).json({
+      message: "Invalid campaign",
     });
   }
 
@@ -448,34 +503,45 @@ router.put("/:id", async (req, res) => {
         throw new OrderError("Order not found", 404);
       }
 
-      // Only pending orders can be edited.
-      // Delivered and cancelled orders are historical and must not change.
-      if (order.status !== "Pending") {
-        throw new OrderError(
-          `Only pending orders can be edited. This order is ${order.status}.`,
-        );
-      }
-
-      // Pending orders always have their stock reserved.
-      const isActive = true;
-
       /*
-       * Pending:
-       * المخزون الحالي ناقص منه مخزون هذا الأوردر.
+       * Orders can be edited in every status - only the inventory treatment
+       * changes:
        *
-       * لذلك:
-       * 1. نرجع القديم
-       * 2. نحجز الجديد
-       *
-       * كل هذا داخل transaction.
-       *
-       * إذا الحجز الجديد فشل، transaction كاملة تنعمل rollback.
+       *   Pending:   stock was reserved, so release the old lines and
+       *              reserve the new ones (full swap inside this transaction;
+       *              a failed rollback undoes everything).
+       *   Delivered: goods already left - nothing is released. Extra stock
+       *              is only needed for added quantity, and it must be
+       *              available; surplus is credited back.
+       *   Cancelled: stock was already restored when cancelled - nothing
+       *              moves.
        */
-      if (isActive) {
-        await releaseStock(order.items, session);
-      }
+      let lines: IOrderItem[];
 
-      const lines = await buildLines(items, session, isActive, order.items);
+      if (order.status === "Pending") {
+        await releaseStock(order.items, session);
+        lines = await buildLines(items, session, true, order.items);
+      } else if (order.status === "Delivered") {
+        lines = await buildLines(items, session, false, order.items);
+
+        for (const adjustment of computeOrderInventoryAdjustments(
+          order.items,
+          items,
+        )) {
+          if (adjustment.delta > 0) {
+            await reserveOne(adjustment.productId, adjustment.delta, session);
+          } else {
+            await Product.updateOne(
+              { _id: adjustment.productId },
+              { $inc: { stock: -adjustment.delta } },
+              { session },
+            );
+          }
+        }
+      } else {
+        /* Cancelled - no stock moves. */
+        lines = await buildLines(items, session, false, order.items);
+      }
 
       const { total, profit } = calcOrder(lines, deliveryCharged, deliveryCost);
 
@@ -487,6 +553,7 @@ router.put("/:id", async (req, res) => {
         deliveryCost,
         total,
         profit,
+        campaign,
       });
 
       await order.save({ session });
@@ -569,6 +636,7 @@ router.patch("/:id/status", async (req, res) => {
         throw new OrderError("Order not found", 404);
       }
 
+      const previousStatus = order.status;
       const transition = resolveStatusTransition(order.status, newStatus);
 
       if (!transition.allowed) {
@@ -581,6 +649,12 @@ router.patch("/:id/status", async (req, res) => {
       }
 
       order.status = transition.next;
+
+      /* Remember when an order was first delivered for profitability. */
+      if (transition.next === "Delivered" && previousStatus !== "Delivered") {
+        order.deliveredAt = new Date();
+      }
+
       await order.save({ session });
 
       return order;

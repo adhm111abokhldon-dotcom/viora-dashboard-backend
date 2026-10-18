@@ -26,6 +26,20 @@ export interface IOrder extends Document {
   total: number;
   profit: number;
   status: OrderStatus;
+  /**
+   * The campaign this order was attributed to (optional). Stored as a
+   * snapshot so the attribution survives even if the campaign is later
+   * renamed or unlinked.
+   */
+  campaign?: {
+    key: string;
+    store: "viora";
+    accountId: string;
+    campaignId: string | null;
+    campaign: string;
+  } | null;
+  /** When the order first became Delivered - null unless/until delivered. */
+  deliveredAt?: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -59,6 +73,16 @@ const orderSchema = new Schema<IOrder>(
       enum: ["Pending", "Delivered", "Cancelled"],
       default: "Pending",
     },
+    /* Snapshot of the campaign the order was attributed to at order time. */
+    campaign: {
+      key: { type: String, trim: true },
+      store: { type: String, trim: true },
+      accountId: { type: String, trim: true },
+      campaignId: { type: String, trim: true },
+      campaign: { type: String, trim: true },
+      _id: false,
+    },
+    deliveredAt: { type: Date },
   },
   { timestamps: true },
 );
@@ -68,9 +92,11 @@ const orderSchema = new Schema<IOrder>(
  *  - product performance / product detail / products table all filter on
  *    "items.productId" (multikey index over the item array)
  *  - every list, report and dashboard window filters on status + createdAt
+ *  - campaign detail page looks up attributed orders by campaign key
  */
 orderSchema.index({ "items.productId": 1 });
 orderSchema.index({ status: 1, createdAt: -1 });
+orderSchema.index({ "campaign.key": 1 });
 
 
 export default mongoose.model<IOrder>("Order", orderSchema);

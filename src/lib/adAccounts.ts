@@ -60,13 +60,52 @@ export function campaignKeyFor(
   store: StoreId,
   accountId: string,
   campaign: string,
+  campaignId?: string | null,
 ): string {
+  const safeCampaignId =
+    campaignId && campaignId.trim() ? campaignId.trim() : null;
+  if (safeCampaignId) {
+    return [
+      store,
+      accountId || "unknown",
+      `cid:${safeCampaignId}`,
+      campaign,
+    ].join("|");
+  }
   return [store, accountId || "unknown", campaign].join("|");
+}
+
+/** Key used by campaign links and catalog entries created before Windsor
+ *  started returning stable campaign ids - no `cid:` segment. */
+export function legacyCampaignKeyFor(
+  store: StoreId,
+  accountId: string,
+  campaign: string,
+): string {
+  return campaignKeyFor(store, accountId, campaign);
+}
+
+/** Every key variant that may refer to the same campaign: the key itself
+ *  plus, for `cid:` keys, the legacy name-only key used before campaign ids
+ *  existed. Used when looking up a campaign that was linked under the old
+ *  format. */
+export function campaignKeyVariants(key: string): string[] {
+  const parsed = parseCampaignKey(key);
+  if (!parsed || !parsed.campaignId) return [key];
+  return [
+    key,
+    legacyCampaignKeyFor(parsed.store, parsed.accountId, parsed.campaign),
+  ];
 }
 
 export function parseCampaignKey(
   key: string,
-): { store: StoreId; accountId: string; campaign: string } | null {
+): {
+  store: StoreId;
+  accountId: string;
+  campaignId: string | null;
+  campaign: string;
+} | null {
   const firstSeparator = key.indexOf("|");
   const secondSeparator = key.indexOf("|", firstSeparator + 1);
   if (firstSeparator < 1 || secondSeparator < 0) return null;
@@ -75,8 +114,18 @@ export function parseCampaignKey(
   const accountId = key.slice(firstSeparator + 1, secondSeparator);
   if (store !== "viora" || !accountId) return null;
 
-  const campaign = key.slice(secondSeparator + 1);
-  if (!campaign) return null;
+  const remainder = key.slice(secondSeparator + 1);
+  if (!remainder) return null;
 
-  return { store, accountId, campaign };
+  let campaignId: string | null = null;
+  let campaign = remainder;
+  const cidMarker = "cid:";
+  if (remainder.startsWith(cidMarker)) {
+    const markerEnd = remainder.indexOf("|", cidMarker.length);
+    campaignId = markerEnd < 0 ? remainder.slice(cidMarker.length) : remainder.slice(cidMarker.length, markerEnd);
+    campaign = markerEnd < 0 ? "" : remainder.slice(markerEnd + 1);
+    if (!campaignId || !campaign) return null;
+  }
+
+  return { store, accountId, campaignId, campaign };
 }

@@ -8,7 +8,7 @@ const itemSchema = z.object({
     .positive(),
   unitPrice: z.coerce
     .number()
-    .positive("Unit price must be greater than 0"),
+    .nonnegative("Unit price must be 0 or more (free gifts are 0)"),
 });
 
 export const createOrderSchema = z
@@ -18,6 +18,9 @@ export const createOrderSchema = z
     items: z.array(itemSchema).min(1, "Add at least one product"),
     deliveryCharged: z.coerce.number().nonnegative().default(0),
     deliveryCost: z.coerce.number().nonnegative().default(0),
+    /** Campaign the order is attributed to (optional). Validated against the
+     *  configured business account in the route. */
+    campaignKey: z.string().trim().min(1).nullish().default(null),
   })
   .superRefine((data, context) => {
     // One line per product: duplicates would split the same product across

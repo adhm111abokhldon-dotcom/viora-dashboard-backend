@@ -70,6 +70,11 @@ export interface IAdvertisingExpense extends Document {
   /** Windsor ad account id - ONE connection can hold several. */
   accountId?: string;
 
+  /** Windsor's stable campaign id for this row. Rows synced before this
+   *  field existed (and rows Windsor returned without an id) are null and
+   *  are matched by campaign name instead. */
+  campaignId?: string;
+
   /** Windsor ad account display name, as reported by Windsor. */
   accountName?: string;
 
