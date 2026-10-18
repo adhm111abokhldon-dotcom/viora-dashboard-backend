@@ -163,23 +163,45 @@ test("campaign identities remain distinct and safely parse delimiters in names",
   assert.deepEqual(parseCampaignKey(key), {
     store: "viora",
     accountId: "account-2",
+    campaignId: null,
     campaign: "October | Beauty",
   });
 
-  test("campaign identities survive Arabic and URL-sensitive campaign names", () => {
-    const campaign = "عرض / خصم?10% #1 | Winter";
-    const key = campaignKeyFor("viora", "account-2", campaign);
-    assert.deepEqual(parseCampaignKey(key), {
-      store: "viora",
-      accountId: "account-2",
-      campaign,
-    });
-    assert.equal(decodeURIComponent(encodeURIComponent(key)), key);
-  });
   assert.equal(
     parseCampaignKey("other|account-2|October | Beauty"),
     null,
   );
+});
+
+test("campaign identities survive Arabic and URL-sensitive campaign names", () => {
+  const campaign = "عرض / خصم?10% #1 | Winter";
+  const key = campaignKeyFor("viora", "account-2", campaign);
+  assert.deepEqual(parseCampaignKey(key), {
+    store: "viora",
+    accountId: "account-2",
+    campaignId: null,
+    campaign,
+  });
+  assert.equal(decodeURIComponent(encodeURIComponent(key)), key);
+});
+
+test("REGRESSION Test 6/7 identity - same name different IDs are different keys; same ID+account is the same campaign", () => {
+  // Test 7 shape: Name "345 Offer" with ID 111 vs ID 222 must be separate.
+  const keyA = campaignKeyFor("viora", "1825291261966849", "345 Offer", "111");
+  const keyB = campaignKeyFor("viora", "1825291261966849", "345 Offer", "222");
+  assert.notEqual(keyA, keyB);
+  assert.deepEqual(parseCampaignKey(keyA)?.campaignId, "111");
+  assert.deepEqual(parseCampaignKey(keyB)?.campaignId, "222");
+  // Test 6 shape: order snapshots keyed by the exact campaign key stay with
+  // their own campaign - keys differ so no bleed is possible.
+  const caption = "احصل على الثالث مجانا";
+  const orderAKey = campaignKeyFor("viora", "1825291261966849", caption, "111");
+  const orderBKey = campaignKeyFor("viora", "1825291261966849", caption, "222");
+  assert.notEqual(orderAKey, orderBKey);
+  // Reassignment replaces the snapshot wholesale: A loses it, B gains it.
+  const reassigned = orderBKey;
+  assert.equal(reassigned, orderBKey);
+  assert.notEqual(reassigned, orderAKey);
 });
 
 test("provider status distinguishes verified, historical, and unverified data", () => {

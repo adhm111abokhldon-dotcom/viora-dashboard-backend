@@ -247,7 +247,7 @@ router.get("/:id/performance", async (req, res) => {
       cost: number;
     };
     type CampaignSpend = {
-      _id: { store: StoreId; accountId: string; campaign: string };
+      _id: { store: StoreId; accountId: string; campaign: string; campaignId?: string | null };
       spend: number;
       messages: number;
       clicks: number;
@@ -337,10 +337,14 @@ router.get("/:id/performance", async (req, res) => {
                 $match: {
                   source: "windsor",
                   ...excludeUnmappedWindsorAccountsFilter(),
+                  // STABLE IDENTITY: match the exact campaign by account + id.
+                  // Null campaignId matches legacy name-only rows; same-named
+                  // campaigns with different ids never pool their spend.
                   $or: campaignRefs.map((ref) => ({
                     store: ref.store,
                     accountId: ref.accountId,
                     campaign: ref.campaign,
+                    campaignId: (ref as { campaignId?: string | null }).campaignId ?? null,
                   })),
                 },
               },
@@ -351,6 +355,7 @@ router.get("/:id/performance", async (req, res) => {
                     store: "$store",
                     accountId: "$accountId",
                     campaign: "$campaign",
+                    campaignId: "$campaignId",
                   },
                   spend: { $sum: "$amount" },
                   messages: { $sum: { $ifNull: ["$messages", 0] } },
@@ -405,7 +410,7 @@ router.get("/:id/performance", async (req, res) => {
 
     const spendByKey = new Map(
       spendRows.map((row) => [
-        campaignKeyFor(row._id.store, row._id.accountId, row._id.campaign),
+        campaignKeyFor(row._id.store, row._id.accountId, row._id.campaign, row._id.campaignId ?? null),
         row,
       ]),
     );
@@ -718,11 +723,15 @@ router.post("/:id/campaigns", async (req, res) => {
       return res.status(404).json({ message: "Product not found" });
     }
 
+    // Resolve the link target by STABLE identity (account + campaign id),
+    // never by name alone: same-named campaigns with different ids are
+    // different link targets. Null id matches legacy name-only rows.
     const campaignExists = await AdvertisingExpense.exists({
       source: "windsor",
       store: campaignRef.store,
       accountId: campaignRef.accountId,
       campaign: campaignRef.campaign,
+      campaignId: (campaignRef as { campaignId?: string | null }).campaignId ?? null,
       ...excludeUnmappedWindsorAccountsFilter(),
     });
     if (!campaignExists) {

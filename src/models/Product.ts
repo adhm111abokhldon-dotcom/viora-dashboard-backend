@@ -3,8 +3,11 @@ import mongoose, { Document, Schema, Types } from "mongoose";
 /** One advertising campaign linked to a product (many-to-many). */
 export interface ICampaignRef {
   /**
-   * Stable opaque identity `store|accountId|campaignName` - derived from the
-   * three fields below when the product is saved, never parsed back.
+   * Stable opaque identity `store|accountId|cid:campaignId|campaignName` -
+   * derived from the fields below when the product is saved, never parsed
+   * back. The campaign NAME is display-only: same-named campaigns with
+   * different stable ids link as separate campaigns. `campaignId` is null
+   * only for links created before Windsor returned ids (legacy name-only).
    * Querying goes through this key so campaign names containing "|" are safe.
    */
   key: string;
@@ -13,6 +16,8 @@ export interface ICampaignRef {
   accountId: string;
   /** Campaign display name exactly as reported by Windsor. */
   campaign: string;
+  /** Stable Meta campaign id; null only for legacy name-only links. */
+  campaignId?: string | null;
 }
 
 export interface IProduct extends Document {
@@ -41,6 +46,7 @@ const campaignRefSchema = new Schema<ICampaignRef>(
     store: { type: String, enum: ["viora"], required: true },
     accountId: { type: String, required: true, trim: true },
     campaign: { type: String, required: true, trim: true },
+    campaignId: { type: String, trim: true, default: null },
   },
   { _id: false },
 );

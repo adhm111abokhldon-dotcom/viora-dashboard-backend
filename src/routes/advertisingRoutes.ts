@@ -564,10 +564,14 @@ router.get("/campaigns/:key/products", async (req, res) => {
         ],
       }
     : {};
+  // STABLE IDENTITY: the detail key carries account + campaign id. The name
+  // is display-only, so same-named campaigns with different ids resolve to
+  // their own spend/orders and never bleed into each other.
   const key = campaignKeyFor(
     campaignRef.store,
     campaignRef.accountId,
     campaignRef.campaign,
+    campaignRef.campaignId ?? null,
   );
 
   try {
@@ -590,6 +594,10 @@ router.get("/campaigns/:key/products", async (req, res) => {
             store: campaignRef.store,
             accountId: campaignRef.accountId,
             campaign: campaignRef.campaign,
+            // Stable id pins the exact campaign: same-named campaigns with
+            // different ids never share spend. Null matches legacy name-only
+            // rows synced before Windsor returned ids.
+            campaignId: campaignRef.campaignId ?? null,
             ...excludeUnmappedWindsorAccountsFilter(),
           },
         },

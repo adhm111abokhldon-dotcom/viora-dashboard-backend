@@ -147,6 +147,7 @@ const advertisingExpenseSchema = new Schema<IAdvertisingExpense>(
     accountId: { type: String, trim: true },
     accountName: { type: String, trim: true },
     accountStatus: { type: String, trim: true },
+    campaignId: { type: String, trim: true },
     campaignEffectiveStatus: { type: String, trim: true },
     campaignConfiguredStatus: { type: String, trim: true },
     lastSeenAt: { type: Date },

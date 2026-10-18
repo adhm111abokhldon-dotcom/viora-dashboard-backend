@@ -186,6 +186,15 @@ export type WindsorFetchAllResult = {
  * Windsor may return an empty campaign-day row alongside its populated row.
  * Collapse those rows before previewing or syncing, and reject conflicting
  * populated rows rather than allowing response order to overwrite metrics.
+ *
+ * CAMPAIGN IDENTITY (never merge on name/caption/creative): rows group by the
+ * stable identity `store + connection + account_id + campaign_id + date`.
+ * When Windsor supplies `campaign_id` the campaign NAME is display-only and
+ * plays no part in the key, so two campaigns sharing a name/caption stay
+ * separate. Rows without an id fall back to the name key and are still
+ * isolated per account/day. Verified against the live Windsor payload
+ * (2026-10-10..17: exactly the 13 requested fields, no breakdown
+ * dimensions, every row carried campaign_id, one name shared by 4 ids).
  */
 /** Normalize a Windsor date to `YYYY-MM-DD`. Windsor returns `YYYY-MM-DD`;
  *  accept an ISO instant too and strip the time portion so grouping never
@@ -199,9 +208,11 @@ export function deduplicateCampaignDayRows(rows: WindsorRow[]): WindsorRow[] {
   const groups = new Map<string, WindsorRow[]>();
 
   for (const row of rows) {
-    /* Same store/connection/account, same day, and the SAME campaign:
-     * campaign id when Windsor gives us one, otherwise the campaign name.
-     * Two different campaigns that happen to share a name stay separate. */
+    /* STABLE IDENTITY: store + connection + account + campaign-id + day.
+     * The campaign name/caption is NEVER identity: when campaign_id exists
+     * the name is excluded from the key entirely, so identical names or
+     * captions (e.g. one name shared by 4 live campaign ids) stay separate.
+     * Null-id rows fall back to a name key, still isolated per account/day. */
     const key = JSON.stringify([
       row.store,
       row.connectionId,
@@ -247,23 +258,32 @@ export function deduplicateCampaignDayRows(rows: WindsorRow[]): WindsorRow[] {
     );
 
     if (signatures.size > 1) {
-      const diagnostics = candidates.map((r) => ({
-        spend: r.spend,
-        clicks: r.clicks,
-        messages: r.messages,
-        costPerMessage: r.costPerMessage,
-        currency: r.currency,
-        campaignEffectiveStatus: r.campaignEffectiveStatus,
-        campaignConfiguredStatus: r.campaignConfiguredStatus,
-      }));
+      /* CONFLICT = same stable identity (store/account/campaign-id/date)
+       * with DIFFERENT metrics. Windsor aggregates server-side per
+       * campaign+day (no breakdown dimensions in the requested fields), so
+       * these are duplicate API records, not summable breakdowns: summing
+       * would double-count spend, picking rows[0] would silently discard
+       * it. Surface the FULL raw rows so the cause can be inspected and a
+       * correct rule chosen per the campaign-identity spec. */
+      const first = group[0]!;
+      const diagnostics = {
+        store: first.store,
+        connectionId: first.connectionId,
+        accountId: first.accountId,
+        campaignId: first.campaignId,
+        campaign: first.campaign,
+        date: normalizeWindsorDate(first.date),
+        rows: candidates.map((row) => ({ ...row })),
+      };
       throw new WindsorError(
-        `Windsor returned conflicting rows for campaign "${
-          group[0]!.campaign
-        }" on ${normalizeWindsorDate(group[0]!.date)}: ${JSON.stringify(
-          diagnostics,
-        )}`,
+        `Windsor returned conflicting rows for the same campaign and day ` +
+          `(account "${first.accountId}", campaign id "${
+            first.campaignId ?? "<none>"
+          }", campaign "${first.campaign}", date "${
+            normalizeWindsorDate(first.date)
+          }"): ${JSON.stringify(diagnostics)}`,
         502,
-        group[0]!.connectionId,
+        first.connectionId,
       );
     }
 

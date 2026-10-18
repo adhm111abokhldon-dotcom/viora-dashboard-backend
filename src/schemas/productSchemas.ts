@@ -7,17 +7,22 @@ import {
 /**
  * One advertising campaign linked to a product.
  *
- * The client sends the three identity fields; `key` is derived SERVER-SIDE
- * so a tampered or stale key can never create a phantom relationship.
+ * IDENTITY = store + accountId + campaignId (stable Meta id). The campaign
+ * NAME is display-only: two campaigns sharing a name but with different ids
+ * are different campaigns and link separately. `campaignId` is optional only
+ * for rows created before Windsor returned ids (legacy name-only links).
+ * The client sends the identity fields; `key` is derived SERVER-SIDE so a
+ * tampered or stale key can never create a phantom relationship.
  * Duplicates are removed by key - the same campaign can be listed only once
- * per product, while different accounts with identical campaign names stay
- * separate (their keys differ).
+ * per product, while same-named campaigns with different ids stay separate
+ * (their keys differ).
  */
 export const campaignRefSchema = z
   .object({
     store: z.literal("viora"),
     accountId: z.string().trim().min(1, "Campaign account is required"),
     campaign: z.string().trim().min(1, "Campaign name is required"),
+    campaignId: z.string().trim().min(1).nullish().default(null),
   })
   .superRefine((ref, context) => {
     if (!isKnownBusinessAccount(ref.store, ref.accountId)) {
@@ -30,7 +35,8 @@ export const campaignRefSchema = z
   })
   .transform((ref) => ({
     ...ref,
-    key: campaignKeyFor(ref.store, ref.accountId, ref.campaign),
+    campaignId: ref.campaignId ?? null,
+    key: campaignKeyFor(ref.store, ref.accountId, ref.campaign, ref.campaignId ?? null),
   }));
 
 export const campaignLinkSchema = campaignRefSchema;
