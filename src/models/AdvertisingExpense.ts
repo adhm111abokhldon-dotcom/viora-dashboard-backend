@@ -189,3 +189,4 @@ const AdvertisingExpense = mongoose.model<IAdvertisingExpense>(
 );
 
 export default AdvertisingExpense;
+// hddd
